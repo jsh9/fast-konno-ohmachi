@@ -1,36 +1,13 @@
-"""
-[Description]
-    This module performs Konno-Ohmachi smoothing very fast.
-
-    It has pre-calculated smoothing window values built-in, thus
-    circumventing the need to re-calculate "w" every time. Compared to
-    ordinary Konno-Ohmachi smoothing algorithms, this module is ~50% faster.
-
-[References]
-    The formula of Konno-Ohmachi smoothing window is here:
-        http://www.geopsy.org/wiki/index.php/Smoothing_details
-
-    Original paper:
-        K. Konno & T. Ohmachi (1998) "Ground-motion characteristics estimated
-        from spectral ratio between horizontal and vertical components of
-        microtremor." Bulletin of the Seismological Society of America.
-        Vol.88, No.1, 228-241.
-
-        Abstract:
-            http://www.bssaonline.org/content/88/1/228.short
-        K. Konno's own PDF copy:
-            http://www.eq.db.shibaura-it.ac.jp/papers/Konno&Ohmachi1998.pdf
-
-[Notes]
-First written in 2013 in MATLAB. Translated to Python in 2017.
-"""
-
+"""First written in 2013 in MATLAB. Translated to Python in 2017."""
 import sys
 import itertools
 import multiprocessing as mp
 import numpy as np
 
 from fast_konno_ohmachi._precalculated import PRE_CALCULATED_SMOOTHING_WINDOWS
+
+
+PROGRESS_BAR_WIDTH = 40  # unit: characters
 
 
 def fast_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=True):
@@ -68,22 +45,16 @@ def fast_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
     y = np.zeros(L)  # pre-allocation of smoothed signal
 
     ref_array = _ref_array_lookup(b)
-
-    ref_z = np.arange(0.5, 2.001, 0.001)  # equivalent to 0.5:0.001:2 in MATLAB
+    ref_z = _calc_ref_z()
 
     if progress_bar:
-        progress_bar_width = 40  # unit: characters
-        print('\n|------------    Progress    ------------|')  # reference bar
-        sys.stdout.write('|')
+        _print_progress_bar_header()
 
     for i in range(L):  # Moving window smoothing: fc from f[1] to f[-2]
-        if progress_bar and (np.remainder(i, L//progress_bar_width) == 0):
-            sys.stdout.write('|')  # prints "|" without spaces or new lines
-
+        _print_progress(progress_bar, i, L)
         y[i] = _smooth(i=i, f=f, L=L, ref_z=ref_z, ref_array=ref_array, x=x)
 
-    y[0] = y[1]  # calculate first and last indices
-    y[-1] = y[-2]
+    _calc_first_last_points(y)
 
     if progress_bar:
         sys.stdout.write('|\n')
@@ -125,18 +96,15 @@ def faster_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, n_cores=None):
 
     L = len(x)
     ref_array = _ref_array_lookup(b)
-    ref_z = np.arange(0.5, 2.001, 0.001)  # equivalent to 0.5:0.001:2 in MATLAB
+    ref_z = _calc_ref_z()
 
-    # =======  Moving window smoothing: fc from f[1] to f[-2]  ========
     p = mp.Pool(n_cores)
     y = p.map(
         _loop_body,
         itertools.product(range(L), [f], [L], [ref_z], [ref_array], [x]),
     )
 
-    y[0] = y[1]  # calculate first and last indices
-    y[-1] = y[-2]
-
+    _calc_first_last_points(y)
     return y
 
 
@@ -223,13 +191,10 @@ def slow_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
     y = np.zeros(L)  # pre-allocation of smoothed signal
 
     if progress_bar:
-        progress_bar_width = 40  # unit: characters
-        print('\n|------------    Progress    ------------|')  # reference bar
-        sys.stdout.write('|')
+        _print_progress_bar_header()
 
     for i in range(L):  # Moving window smoothing: fc from f[1] to f[-2]
-        if progress_bar and (np.remainder(i, L/progress_bar_width) == 0):
-            sys.stdout.write('|')  # prints "|" without spaces or new lines
+        _print_progress(progress_bar, i, L)
 
         if (i == 0) or (i == L-1):
             continue  # skip first and last indices for now
@@ -243,8 +208,7 @@ def slow_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
 
         y[i] = np.dot(w, x) / np.sum(w)  # apply smoothing filter to "x"
 
-    y[0] = y[1]  # calculate first and last indices
-    y[-1] = y[-2]
+    _calc_first_last_points(y)
 
     if progress_bar:
         sys.stdout.write('|\n')
@@ -282,7 +246,29 @@ def _process_smooth_coeff(smooth_coeff):
 
 
 def _ref_array_lookup(b):
-    # Extract (b/2)-th row from A as "reference array" because A's 1st row
-    # corresponds to b = 2, and A's 2nd row corresponds to b = 4, etc.
+    # Extract (b/2)-th row from PRE_CALCULATED_SMOOTHING_WINDOWS as "reference
+    # array" because PRE_CALCULATED_SMOOTHING_WINDOWS's 1st row
+    # corresponds to b = 2, and PRE_CALCULATED_SMOOTHING_WINDOWS's 2nd row
+    # corresponds to b = 4, etc.
+    #
     # Note: "int(b/2.0)-1" has "-1" because row index in Python starts from 0
     return PRE_CALCULATED_SMOOTHING_WINDOWS[int(b / 2.0) - 1, :]
+
+
+def _calc_ref_z():
+    return np.arange(0.5, 2.001, 0.001)  # equivalent to 0.5:0.001:2 in MATLAB
+
+
+def _print_progress_bar_header():
+    print('\n|------------    Progress    ------------|')  # reference bar
+    sys.stdout.write('|')
+
+
+def _print_progress(progress_bar, i, L):
+    if progress_bar and (np.remainder(i, L // PROGRESS_BAR_WIDTH) == 0):
+        sys.stdout.write('|')  # prints "|" without spaces or new lines
+
+
+def _calc_first_last_points(y) -> None:
+    y[0] = y[1]  # calculate first and last indices
+    y[-1] = y[-2]
