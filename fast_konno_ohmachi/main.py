@@ -20,6 +20,9 @@
             http://www.bssaonline.org/content/88/1/228.short
         K. Konno's own PDF copy:
             http://www.eq.db.shibaura-it.ac.jp/papers/Konno&Ohmachi1998.pdf
+
+[Notes]
+First written in 2013 in MATLAB. Translated to Python in 2017.
 """
 
 import sys
@@ -58,33 +61,13 @@ def fast_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
     numpy.ndarray
         The smoothed signal (1D numpy array).
     """
-    x = np.array(raw_signal).flatten()
-    f = np.array(freq_array).flatten()
-    b = smooth_coeff
-
-    if round(b) != b:
-        b = round(b)   # round non integers
-
-    if np.remainder(b, 2) == 1:  # if b is odd
-        b = b-1  # make it even
-
-    if b < 2:
-        b = 2  # "cup" b value
-
-    if b > 100:
-        b = 100  # "cap" b value
-
-    if len(x) != len(f):
-        msg = 'Length of input signal and frequency array must be the same.'
-        raise ValueError(msg)
+    x, f = _process_signal_and_freq(raw_signal, freq_array)
+    b = _process_smooth_coeff(smooth_coeff)
 
     L = len(x)
     y = np.zeros(L)  # pre-allocation of smoothed signal
 
-    # Extract (b/2)-th row from A as "reference array" because A's 1st row
-    # corresponds to b = 2, and A's 2nd row corresponds to b = 4, etc.
-    # Note: "int(b/2.0)-1" has "-1" because row index in Python starts from 0
-    ref_array = PRE_CALCULATED_SMOOTHING_WINDOWS[int(b / 2.0) - 1, :]
+    ref_array = _ref_array_lookup(b)
 
     ref_z = np.arange(0.5, 2.001, 0.001)  # equivalent to 0.5:0.001:2 in MATLAB
 
@@ -93,39 +76,11 @@ def fast_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
         print('\n|------------    Progress    ------------|')  # reference bar
         sys.stdout.write('|')
 
-    # =======  Moving window smoothing: fc from f[1] to f[-2]  ========
-    for i in range(L):
+    for i in range(L):  # Moving window smoothing: fc from f[1] to f[-2]
         if progress_bar and (np.remainder(i, L//progress_bar_width) == 0):
             sys.stdout.write('|')  # prints "|" without spaces or new lines
 
-        if (i == 0) or (i == L-1):
-            continue  # skip first and last indices for now
-
-        fc = f[i]  # central frequency
-        w = np.zeros(L)  # pre-allocation of smoothing window "w"
-
-        z = f / fc  # "z" = dimensionless frequency, normalized by fc
-        z = z[np.where(z >= 0.5)]  # only keep elements between 0.5 and 2.0,
-        z = z[np.where(z <= 2.0)]  # because outsize [0.5, 2.0], w is almost 0
-
-        # Note: In practice, w is almost 0 when z (normalized frequency)
-        #       is outside [0.5, 2.0].  Thus only the non-zero part of
-        #       "w", i.e., "w0", is calculated via interpolation.
-        #       Then, "w" is reconstructed from "w0" by padding zeros.
-        w0 = np.interp(z, ref_z, ref_array)  # 1D interpolation
-
-        idx = np.argmax(w0)  # the index where w0 has maximum value
-        shift = i+1 - idx  # i+1 = "true index" (starting from 1 rather than 0)
-
-        # shift w0 to the right by "shift", and pad zeros in front
-        w0 = np.lib.pad(w0, (shift, 0), mode='constant', constant_values=(0))
-
-        if len(w0) >= len(w):  # if length of w0 already exceeds w
-            w = w0[0:len(w)]  # trim w0 down to the same length as w
-        else:  # otherwise, put w0 into w
-            w[0:len(w0)] = w0
-
-        y[i] = np.dot(w, x) / np.sum(w)  # apply smoothing filter to "x"
+        y[i] = _smooth(i=i, f=f, L=L, ref_z=ref_z, ref_array=ref_array, x=x)
 
     y[0] = y[1]  # calculate first and last indices
     y[-1] = y[-2]
@@ -165,30 +120,11 @@ def faster_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, n_cores=None):
     numpy.ndarray
         The smoothed signal (1D numpy array).
     """
-    x = np.array(raw_signal).flatten()
-    f = np.array(freq_array).flatten()
-    b = smooth_coeff
-
-    if round(b) != b:
-        b = round(b)   # round non integers
-    if np.remainder(b, 2) == 1:  # if b is odd
-        b = b - 1  # make it even
-    if b < 2:
-        b = 2  # "cup" b value
-    if b > 100:
-        b = 100  # "cap" b value
-
-    if len(x) != len(f):
-        msg = 'Length of input signal and frequency array must be the same.'
-        raise ValueError(msg)
+    x, f = _process_signal_and_freq(raw_signal, freq_array)
+    b = _process_smooth_coeff(smooth_coeff)
 
     L = len(x)
-
-    # Extract (b/2)-th row from A as "reference array" because A's 1st row
-    # corresponds to b = 2, and A's 2nd row corresponds to b = 4, etc.
-    # Note: "int(b/2.0)-1" has "-1" because row index in Python starts from 0
-    ref_array = PRE_CALCULATED_SMOOTHING_WINDOWS[int(b / 2.0) - 1, :]
-
+    ref_array = _ref_array_lookup(b)
     ref_z = np.arange(0.5, 2.001, 0.001)  # equivalent to 0.5:0.001:2 in MATLAB
 
     # =======  Moving window smoothing: fc from f[1] to f[-2]  ========
@@ -206,18 +142,21 @@ def faster_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, n_cores=None):
 
 def _loop_body(para):
     """
-    The loop body to be passed to the paralle pool.
+    The loop body to be passed to the parallel workers.
 
     A subroutine for faster_konno_ohmachi().
 
     Notes:
     1. Due to the limitation of the multiprocessing module of Python, it cannot
-       be put within faster_konno_ohmachi() as a local function.)
+       be put within faster_konno_ohmachi() as a local function.
     2. Python 2.7 does not have Pool.starmap method, thus the loop body can only
        take one parameter, and then unpack.
     """
     i, f, L, ref_z, ref_array, x = para  # unpack
+    return _smooth(i=i, f=f, L=L, ref_z=ref_z, ref_array=ref_array, x=x)
 
+
+def _smooth(*, i, f, L, ref_z, ref_array, x):
     fc = f[i]  # central frequency
     w = np.zeros(L)  # pre-allocation of smoothing window "w"
 
@@ -232,10 +171,10 @@ def _loop_body(para):
     w0 = np.interp(z, ref_z, ref_array)  # 1D interpolation
 
     idx = np.argmax(w0)  # the index where w0 has maximum value
-    shift = i+1 - idx  # i+1 = "true index" (starting from 1 rather than 0)
+    shift = i + 1 - idx  # i+1 = "true index" (starting from 1 rather than 0)
 
     # shift w0 to the right by "shift", and pad zeros in front
-    w0 = np.lib.pad(w0, (shift, 0), mode='constant', constant_values=(0))
+    w0 = np.pad(w0, (shift, 0), mode='constant', constant_values=0)
 
     if len(w0) >= len(w):  # if length of w0 already exceeds w
         w = w0[0:len(w)]  # trim w0 down to the same length as w
@@ -275,14 +214,10 @@ def slow_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
     numpy.ndarray
         The smoothed signal (1D numpy array).
     """
-    x = np.array(raw_signal).flatten()
-    f = np.array(freq_array).flatten()
-    f_shifted = f / (1 + 1e-4)  # shift slightly to avoid numerical errors
+    x, f = _process_signal_and_freq(raw_signal, freq_array)
     b = float(smooth_coeff)
 
-    if len(x) != len(f):
-        msg = 'Length of input signal and frequency array must be the same.'
-        raise ValueError(msg)
+    f_shifted = f / (1 + 1e-4)  # shift slightly to avoid numerical errors
 
     L = len(x)
     y = np.zeros(L)  # pre-allocation of smoothed signal
@@ -292,8 +227,7 @@ def slow_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
         print('\n|------------    Progress    ------------|')  # reference bar
         sys.stdout.write('|')
 
-    # =======  Moving window smoothing: fc from f[1] to f[-2]  ========
-    for i in range(L):
+    for i in range(L):  # Moving window smoothing: fc from f[1] to f[-2]
         if progress_bar and (np.remainder(i, L/progress_bar_width) == 0):
             sys.stdout.write('|')  # prints "|" without spaces or new lines
 
@@ -316,3 +250,39 @@ def slow_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
         sys.stdout.write('|\n')
 
     return y
+
+
+def _process_signal_and_freq(raw_signal, freq_array):
+    x = np.array(raw_signal).flatten()
+    f = np.array(freq_array).flatten()
+
+    if len(x) != len(f):
+        msg = 'Length of input signal and frequency array must be the same.'
+        raise ValueError(msg)
+
+    return x, f
+
+
+def _process_smooth_coeff(smooth_coeff):
+    b = smooth_coeff
+
+    if round(b) != b:
+        b = round(b)  # round non integers
+
+    if np.remainder(b, 2) == 1:  # if b is odd
+        b = b - 1  # make it even
+
+    if b < 2:
+        b = 2  # "cup" b value
+
+    if b > 100:
+        b = 100  # "cap" b value
+
+    return b
+
+
+def _ref_array_lookup(b):
+    # Extract (b/2)-th row from A as "reference array" because A's 1st row
+    # corresponds to b = 2, and A's 2nd row corresponds to b = 4, etc.
+    # Note: "int(b/2.0)-1" has "-1" because row index in Python starts from 0
+    return PRE_CALCULATED_SMOOTHING_WINDOWS[int(b / 2.0) - 1, :]
