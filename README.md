@@ -1,30 +1,30 @@
 # _Fast_ Konno-Ohmachi
 
-A Python library that performs Konno-Ohmachi spectral smoothing very fast (reduces running time by ~60%).
+A Python library that performs Konno-Ohmachi spectral smoothing very fast (2x speedup compared to the "vanilla" Konno-Ohmachi smoothing algorithm).
 
 ## Background
-Konno-Ohmachi is a smoothing algorithm proposed by Konno & Ohmachi (1998) [[Abstract](http://bssa.geoscienceworld.org/content/88/1/228.short), [PDF](http://www.eq.db.shibaura-it.ac.jp/papers/Konno&Ohmachi1998.pdf)], which achieves a "uniform-span" smoothing to frequency spectra in logarithmic scale.
+Konno-Ohmachi is a smoothing algorithm proposed by Konno & Ohmachi (1998) [[abstract](http://bssa.geoscienceworld.org/content/88/1/228.short), [PDF](http://www.eq.db.shibaura-it.ac.jp/papers/Konno&Ohmachi1998.pdf)], which achieves a "uniform-span" smoothing to frequency spectra in the logarithmic scale.
 
-For lower frequencies, the Konno-Ohmachi smoothing window is narrower (i.e., less smoothing), and for higher frequencies, the window is wider (i.e., more smoothing). Conventional smoothing filters use same smoothing window widths at all locations.
+For lower frequencies, the Konno-Ohmachi smoothing window is narrower (i.e., less smoothing), and for higher frequencies, the window is wider (i.e., more smoothing).
 
-This makes the Konno-Ohmachi filter desirable in seismology, where seismologists often try to avoid over-smoothing lower frequencies (< 10 Hz).
+This makes the Konno-Ohmachi filter particularly appealing to seismologists, who often try to avoid over-smoothing lower frequencies (< 10 Hz) of seismic wave signals.
 
-The plot below shows the result of Konno-Ohmachi filter versus a "conventional" median value filter [[Wiki](https://en.wikipedia.org/wiki/Median_filter)]. The two filters yield similar results for frequency > 5 Hz, but for lower frequencies, the median filter over-smoothes the raw spectrum, which is undesirable.
+The plot below shows the result of Konno-Ohmachi filter versus a regular [median value filter](https://en.wikipedia.org/wiki/Median_filter). The two filters yield similar results for frequency > 5 Hz, but for lower frequencies, the median filter over-smoothes the original signal, which is undesirable.
 
 ![](demo.png)
-###### (The raw signal used in this example is the Fourier amplitude spectrum of a ground acceleration waveform recorded during the Magnitude-9.0 Tohoku-Oki Earthquake on March 11, 2011.)
+#### (The raw signal used in this example is the Fourier amplitude spectrum of a ground acceleration waveform recorded during the [Magnitude-9.0 Tohoku-Oki Earthquake on March 11, 2011](https://en.wikipedia.org/wiki/2011_T%C5%8Dhoku_earthquake_and_tsunami).)
 
 ## Computation speed
 
-Conventionally, Konno-Ohmachi filtering is time-consuming due to its varying smoothing window widths.
+Conventionally, Konno-Ohmachi filtering is time-consuming because its smoothing windows are different at each frequency and need to be calculated one by one.
 
 This library achieves a 2x speedup by pre-calculating smoothing windows (i.e., trading memory space for speed).
 
 It can speed up calculation even further by performing parallel computing (the `faster_konno_ohmachi()` function).
 
-The only two minor compromises in order to achieve the 2x speedup are:
-- It takes 1-2 seconds to import this library, a one-time cost
+The only minor compromises in order to achieve the 2x speedup are:
 - Only even integer smoothing strengths from 2 to 100 are supported. This is not an issue in reality because people rarely need non-integer smoothing strengths.
+- The smoothing results from `fast_konno_ohmachi()` and `faster_konno_ohmachi()` are not entirely identical to the smoothing result from `slow_konno_ohmachi()` (the "vanilla" algorithm). However, the differences are too minor to have any practical implications.
 
 ## Installation
 
@@ -44,13 +44,13 @@ signal = np.sin(freq)
 smoothed = fko.fast_konno_ohmachi(signal, freq, smooth_coeff=40, progress_bar=True)
 ```
 
-or
+or (calculate in parallel)
 
 ```python
 smoothed = fko.faster_konno_ohmachi(signal, freq, smooth_coeff=40, n_cores=4)
 ```
 
-or (of you'd like to see how slow the "vanilla" implementation can be)
+or (if you'd like to see how slow the "vanilla" implementation can be)
 
 ```python
 smoothed = fko.slow_konno_ohmachi(signal, freq, smooth_coeff=40, progress_bar=True)
