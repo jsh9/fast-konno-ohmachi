@@ -74,7 +74,6 @@ def test_fast_konno_ohmachi__downsampled(smooth_coeff, thres):
     _assert_close(expected=smoothed_slow, actual=smoothed_fast, thres=thres)
 
 
-
 def test_faster_konno_ohmachi():
     spec, freq = _load_mat_file()
     smoothed_fast = fko.fast_konno_ohmachi(

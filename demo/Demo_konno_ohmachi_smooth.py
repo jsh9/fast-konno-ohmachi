@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 This Python script uses fast_konno_ohmachi to smooth a sample Fourier spectrum.
 To demonstrate the benefit of Konno-Ohmachi smoothing, we also smooth the
@@ -35,7 +34,7 @@ if __name__ == '__main__':
     __spec__ = None  # this is to circumvent a bug with using Spyder
 
     t1 = time.time()
-    y0 = fko.fast_konno_ohmachi(spec,freq,progress_bar=True)
+    y0 = fko.fast_konno_ohmachi(spec, freq, progress_bar=True)
     t2 = time.time()
     print('\nElapsed time (fast-konno-ohmachi): %.1f sec.' % (t2 - t1))
 
@@ -44,11 +43,11 @@ if __name__ == '__main__':
     t4 = time.time()
     print('\nElapsed time (faster-konno-ohmachi): %.1f sec.' % (t4 - t3))
 
-    assert(np.allclose(y0, y1))  # make sure y0 and y1 are almost identical
+    assert np.allclose(y0, y1)  # make sure y0 and y1 are almost identical
 
     y2 = scipy.signal.medfilt(np.ndarray.flatten(spec), kernel_size=201)
 
-    fig = plt.figure(figsize=(4,3), dpi=150, edgecolor='k', facecolor='w')
+    fig = plt.figure(figsize=(4, 3), dpi=150, edgecolor='k', facecolor='w')
     ax = plt.axes()
     plt.semilogx(freq, spec, c=[0.5]*3, lw=0.5, label='Raw siginal')
     plt.semilogx(freq, y1, 'r', lw=1.5, label='Konno-Ohmachi')

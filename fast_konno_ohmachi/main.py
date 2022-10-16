@@ -108,16 +108,18 @@ def fast_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
         z = z[np.where(z >= 0.5)]  # only keep elements between 0.5 and 2.0,
         z = z[np.where(z <= 2.0)]  # because outsize [0.5, 2.0], w is almost 0
 
+        # Note: In practice, w is almost 0 when z (normalized frequency)
+        #       is outside [0.5, 2.0].  Thus only the non-zero part of
+        #       "w", i.e., "w0", is calculated via interpolation.
+        #       Then, "w" is reconstructed from "w0" by padding zeros.
         w0 = np.interp(z, ref_z, ref_array)  # 1D interpolation
-              # Note: In practice, w is almost 0 when z (normalized frequency)
-              #       is outside [0.5, 2.0].  Thus only the non-zero part of
-              #       "w", i.e., "w0", is calculated via interpolation.
-              #       Then, "w" is reconstructed from "w0" by padding zeros.
 
-        idx = np.argmax(w0) # the index where w0 has maximum value
-        shift = i+1 - idx # i+1 = "true index" (starting from 1 rather than 0)
+        idx = np.argmax(w0)  # the index where w0 has maximum value
+        shift = i+1 - idx  # i+1 = "true index" (starting from 1 rather than 0)
+
+        # shift w0 to the right by "shift", and pad zeros in front
         w0 = np.lib.pad(w0, (shift, 0), mode='constant', constant_values=(0))
-                  # shift w0 to the right by "shift", and pad zeros in front
+
         if len(w0) >= len(w):  # if length of w0 already exceeds w
             w = w0[0:len(w)]  # trim w0 down to the same length as w
         else:  # otherwise, put w0 into w
@@ -223,16 +225,18 @@ def _loop_body(para):
     z = z[np.where(z >= 0.5)]  # only keep elements between 0.5 and 2.0,
     z = z[np.where(z <= 2.0)]  # because outsize [0.5, 2.0], w is almost 0
 
-    w0 = np.interp(z,ref_z,ref_array)  # 1D interpolation
-          # Note: In practice, w is almost 0 when z (normalized frequency)
-          #       is outside [0.5, 2.0].  Thus only the non-zero part of
-          #       "w", i.e., "w0", is calculated via interpolation.
-          #       Then, "w" is reconstructed from "w0" by padding zeros.
+    # Note: In practice, w is almost 0 when z (normalized frequency)
+    #       is outside [0.5, 2.0].  Thus only the non-zero part of
+    #       "w", i.e., "w0", is calculated via interpolation.
+    #       Then, "w" is reconstructed from "w0" by padding zeros.
+    w0 = np.interp(z, ref_z, ref_array)  # 1D interpolation
 
-    idx = np.argmax(w0) # the index where w0 has maximum value
-    shift = i+1 - idx # i+1 = "true index" (starting from 1 rather than 0)
-    w0 = np.lib.pad(w0, (shift, 0) ,mode='constant', constant_values=(0))
-              # shift w0 to the right by "shift", and pad zeros in front
+    idx = np.argmax(w0)  # the index where w0 has maximum value
+    shift = i+1 - idx  # i+1 = "true index" (starting from 1 rather than 0)
+
+    # shift w0 to the right by "shift", and pad zeros in front
+    w0 = np.lib.pad(w0, (shift, 0), mode='constant', constant_values=(0))
+
     if len(w0) >= len(w):  # if length of w0 already exceeds w
         w = w0[0:len(w)]  # trim w0 down to the same length as w
     else:  # otherwise, put w0 into w
@@ -303,7 +307,7 @@ def slow_konno_ohmachi(raw_signal, freq_array, smooth_coeff=40, progress_bar=Tru
         w = (np.sin(b * np.log10(z)) / b / np.log10(z)) ** 4.0
         w[np.isnan(w)] = 0  # replace NaN's with 0
 
-        y[i] = np.dot(w,x) / np.sum(w)  # apply smoothing filter to "x"
+        y[i] = np.dot(w, x) / np.sum(w)  # apply smoothing filter to "x"
 
     y[0] = y[1]  # calculate first and last indices
     y[-1] = y[-2]
