@@ -1,7 +1,10 @@
 //! Konno-Ohmachi smoothing kernels.
 //!
-//! `method="approx"` keeps samples with `|b log10(f / fc)| <= 3`. `method="exact"`
-//! sums the published window over every positive frequency.
+//! `method="approx"` keeps samples with `|b log10(f / fc)| <= 3`. When that
+//! range contains no input sample, that output uses the full exact window.
+//! `method="exact"` sums the published window over every positive frequency.
+
+use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
@@ -150,12 +153,10 @@ pub fn smooth_signal(
     }
     if method == Method::Approx && same_grid(freq_in, freq_out) {
         if let Some(du) = log_spacing(freq_in) {
-            return Ok(convolve(signal, &approx_kernel(bandwidth, du)));
+            return convolve(signal, &approx_kernel(bandwidth, du));
         }
     }
-    Ok(pointwise(
-        freq_in, freq_out, signal, bandwidth, method, n_cores,
-    ))
+    pointwise(freq_in, freq_out, signal, bandwidth, method, n_cores)
 }
 
 pub fn apply_plan(plan: &Plan, signal: &[f64], n_cores: usize) -> Result<Vec<f64>, String> {
@@ -167,7 +168,7 @@ pub fn apply_plan(plan: &Plan, signal: &[f64], n_cores: usize) -> Result<Vec<f64
         ));
     }
     let mut out = vec![0.0; plan.freq_out.len()];
-    apply_into(plan, signal, &mut out, n_cores);
+    apply_into(plan, signal, &mut out, n_cores)?;
     Ok(out)
 }
 
@@ -194,28 +195,35 @@ pub fn apply_many(
         return Ok(flat);
     }
     let workers = n_cores.max(1).min(n_rows);
-    let rows_per = (n_rows + workers - 1) / workers;
+    let rows_per = n_rows.div_ceil(workers);
+    let failure = Mutex::new(None);
     std::thread::scope(|scope| {
         for (group, part) in flat.chunks_mut(rows_per * n_out).enumerate() {
             let row0 = group * rows_per;
             let rows_here = part.len() / n_out;
+            let failure = &failure;
             scope.spawn(move || {
                 for row in 0..rows_here {
                     let sample = &signals[(row0 + row) * n_cols..(row0 + row + 1) * n_cols];
                     let dest = &mut part[row * n_out..(row + 1) * n_out];
-                    apply_into(plan, sample, dest, 1);
+                    if let Err(err) = apply_into(plan, sample, dest, 1) {
+                        *failure.lock().expect("window error lock") = Some(err);
+                    }
                 }
             });
         }
     });
+    if let Some(err) = failure.into_inner().expect("window error lock") {
+        return Err(err);
+    }
     Ok(flat)
 }
 
-fn apply_into(plan: &Plan, signal: &[f64], out: &mut [f64], n_cores: usize) {
+fn apply_into(plan: &Plan, signal: &[f64], out: &mut [f64], n_cores: usize) -> Result<(), String> {
     match &plan.kind {
         Kind::Convolution { kernel } => {
             let values = kernel.as_f64();
-            let smoothed = convolve(signal, &values);
+            let smoothed = convolve(signal, &values)?;
             out.copy_from_slice(&smoothed);
         }
         Kind::Sparse {
@@ -228,10 +236,6 @@ fn apply_into(plan: &Plan, signal: &[f64], out: &mut [f64], n_cores: usize) {
                     let i = offset + local;
                     let a = start[i] as usize;
                     let b = start[i + 1] as usize;
-                    if a == b {
-                        *dest = f64::NAN;
-                        continue;
-                    }
                     let column = col0[i] as usize;
                     let mut total = 0.0;
                     match values {
@@ -251,6 +255,7 @@ fn apply_into(plan: &Plan, signal: &[f64], out: &mut [f64], n_cores: usize) {
             });
         }
     }
+    Ok(())
 }
 
 fn pointwise(
@@ -260,49 +265,70 @@ fn pointwise(
     bandwidth: f64,
     method: Method,
     n_cores: usize,
-) -> Vec<f64> {
+) -> Result<Vec<f64>, String> {
     let log_in: Vec<f64> = freq_in.iter().map(|f| f.log10()).collect();
     let mut out = vec![0.0; freq_out.len()];
+    let failure = Mutex::new(None);
     for_each_chunk(n_cores, &mut out, &|part, offset| {
         for (local, dest) in part.iter_mut().enumerate() {
             let fc = freq_out[offset + local];
             let log_fc = fc.log10();
-            let (lo, hi) = if method == Method::Approx {
-                window_bounds(&log_in, log_fc, bandwidth)
-            } else {
-                (0, freq_in.len())
-            };
-            *dest = normalized_sum(
-                signal, freq_in, &log_in, lo, hi, fc, log_fc, bandwidth, method,
-            );
+            let (lo, hi, approx) = row_window(&log_in, log_fc, bandwidth, method);
+            match normalized_sum(&SampleWindow {
+                signal,
+                freq_in,
+                log_in: &log_in,
+                lo,
+                hi,
+                fc,
+                log_fc,
+                bandwidth,
+                approx,
+            }) {
+                Ok(value) => *dest = value,
+                Err(err) => {
+                    *failure.lock().expect("window error lock") = Some(err);
+                }
+            }
         }
     });
-    out
+    if let Some(err) = failure.into_inner().expect("window error lock") {
+        return Err(err);
+    }
+    Ok(out)
 }
 
-fn normalized_sum(
-    signal: &[f64],
-    freq_in: &[f64],
-    log_in: &[f64],
+struct SampleWindow<'a> {
+    signal: &'a [f64],
+    freq_in: &'a [f64],
+    log_in: &'a [f64],
     lo: usize,
     hi: usize,
     fc: f64,
     log_fc: f64,
     bandwidth: f64,
-    method: Method,
-) -> f64 {
-    let approx = method == Method::Approx;
+    approx: bool,
+}
+
+fn normalized_sum(window: &SampleWindow<'_>) -> Result<f64, String> {
     let mut total = 0.0;
     let mut weight_sum = 0.0;
-    for j in lo..hi {
-        let weight = weight_at(freq_in[j], log_in[j], fc, log_fc, bandwidth, approx);
-        total += weight * signal[j];
+    for j in window.lo..window.hi {
+        let weight = weight_at(
+            window.freq_in[j],
+            window.log_in[j],
+            window.fc,
+            window.log_fc,
+            window.bandwidth,
+            window.approx,
+        );
+        total += weight * window.signal[j];
         weight_sum += weight;
     }
     if weight_sum > 0.0 {
-        total / weight_sum
+        Ok(total / weight_sum)
     } else {
-        f64::NAN
+        Err("Konno-Ohmachi window summed to zero".to_string())
     }
 }
 
@@ -320,35 +346,22 @@ fn build_sparse(
     start.push(0);
     for &fc in freq_out {
         let log_fc = fc.log10();
-        let (lo, hi) = if method == Method::Approx {
-            window_bounds(&log_in, log_fc, bandwidth)
-        } else {
-            (0, freq_in.len())
-        };
+        let (lo, hi, approx) = row_window(&log_in, log_fc, bandwidth, method);
         let row_at = raw.len();
         let mut weight_sum = 0.0;
         for j in lo..hi {
-            let weight = weight_at(
-                freq_in[j],
-                log_in[j],
-                fc,
-                log_fc,
-                bandwidth,
-                method == Method::Approx,
-            );
+            let weight = weight_at(freq_in[j], log_in[j], fc, log_fc, bandwidth, approx);
             raw.push(weight);
             weight_sum += weight;
         }
-        if hi == lo || weight_sum == 0.0 {
-            raw.truncate(row_at);
-            col0.push(0);
-        } else {
-            let scale = 1.0 / weight_sum;
-            for weight in &mut raw[row_at..] {
-                *weight *= scale;
-            }
-            col0.push(u32::try_from(lo).map_err(|_| "frequency grid is too long".to_string())?);
+        if weight_sum == 0.0 {
+            return Err("Konno-Ohmachi window summed to zero".to_string());
         }
+        let scale = 1.0 / weight_sum;
+        for weight in &mut raw[row_at..] {
+            *weight *= scale;
+        }
+        col0.push(u32::try_from(lo).map_err(|_| "frequency grid is too long".to_string())?);
         let end = u32::try_from(raw.len())
             .map_err(|_| "precomputed weights are too large".to_string())?;
         start.push(end);
@@ -399,6 +412,19 @@ fn window_bounds(log_in: &[f64], log_fc: f64, bandwidth: f64) -> (usize, usize) 
     let lo = log_in.partition_point(|&value| bandwidth * (value - log_fc) < -edge);
     let hi = log_in.partition_point(|&value| bandwidth * (value - log_fc) <= edge);
     (lo, hi)
+}
+
+/// Input range `[lo, hi)` and whether the Taylor sinc may be used.
+///
+/// An approximate window with no sample falls back to the full exact sum.
+fn row_window(log_in: &[f64], log_fc: f64, bandwidth: f64, method: Method) -> (usize, usize, bool) {
+    if method == Method::Approx {
+        let (lo, hi) = window_bounds(log_in, log_fc, bandwidth);
+        if hi > lo {
+            return (lo, hi, true);
+        }
+    }
+    (0, log_in.len(), false)
 }
 
 fn weight_at(freq: f64, log_freq: f64, fc: f64, log_fc: f64, bandwidth: f64, approx: bool) -> f64 {
@@ -463,7 +489,7 @@ fn approx_kernel(bandwidth: f64, du: f64) -> Vec<f64> {
     kernel
 }
 
-fn convolve(signal: &[f64], kernel: &[f64]) -> Vec<f64> {
+fn convolve(signal: &[f64], kernel: &[f64]) -> Result<Vec<f64>, String> {
     let half = kernel.len() / 2;
     let mut out = vec![0.0; signal.len()];
     for (i, dest) in out.iter_mut().enumerate() {
@@ -476,13 +502,12 @@ fn convolve(signal: &[f64], kernel: &[f64]) -> Vec<f64> {
                 weight_sum += weight;
             }
         }
-        *dest = if weight_sum > 0.0 {
-            total / weight_sum
-        } else {
-            f64::NAN
-        };
+        if weight_sum == 0.0 {
+            return Err("Konno-Ohmachi window summed to zero".to_string());
+        }
+        *dest = total / weight_sum;
     }
-    out
+    Ok(out)
 }
 
 fn for_each_chunk(n_cores: usize, out: &mut [f64], f: &(impl Fn(&mut [f64], usize) + Sync)) {
@@ -492,7 +517,7 @@ fn for_each_chunk(n_cores: usize, out: &mut [f64], f: &(impl Fn(&mut [f64], usiz
         f(out, 0);
         return;
     }
-    let chunk = (n + workers - 1) / workers;
+    let chunk = n.div_ceil(workers);
     std::thread::scope(|scope| {
         let mut offset = 0;
         for part in out.chunks_mut(chunk) {
@@ -527,7 +552,7 @@ mod tests {
 
     fn assert_log_grid_matches(freq: Vec<f64>, bandwidth: f64) {
         let signal: Vec<f64> = freq.iter().map(|f| (f.ln().sin()).powi(2) + 0.2).collect();
-        let via_point = pointwise(&freq, &freq, &signal, bandwidth, Method::Approx, 1);
+        let via_point = pointwise(&freq, &freq, &signal, bandwidth, Method::Approx, 1).unwrap();
         let via_smooth =
             smooth_signal(&freq, &freq, &signal, bandwidth, Method::Approx, 1).unwrap();
         let plan = build_plan(
@@ -577,6 +602,20 @@ mod tests {
                 (approx - reference).abs() < 1e-8,
                 "x={x} taylor={approx} libm={reference}"
             );
+        }
+    }
+
+    #[test]
+    fn empty_approx_window_matches_exact() {
+        let freq: Vec<f64> = (1..=10).map(|i| i as f64).collect();
+        let signal: Vec<f64> = (0..10).map(|i| 0.2 + i as f64 * 0.15).collect();
+        let freq_out = vec![1.5, 2.0, 5.5];
+        let approx = smooth_signal(&freq, &freq_out, &signal, 100.0, Method::Approx, 1).unwrap();
+        let exact = smooth_signal(&freq, &freq_out, &signal, 100.0, Method::Exact, 1).unwrap();
+        assert!(approx.iter().all(|value| value.is_finite()));
+        for index in [0, 2] {
+            let scale = exact[index].abs().max(1.0);
+            assert!((approx[index] - exact[index]).abs() <= 1e-12 * scale);
         }
     }
 

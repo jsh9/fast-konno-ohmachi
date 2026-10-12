@@ -48,16 +48,16 @@ fn as_f64_2d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usiz
     Ok((data, dims[0], dims[1]))
 }
 
-fn vector_out<'py>(py: Python<'py>, data: Vec<f64>) -> Bound<'py, PyArray1<f64>> {
+fn vector_out(py: Python<'_>, data: Vec<f64>) -> Bound<'_, PyArray1<f64>> {
     PyArray1::from_vec(py, data)
 }
 
-fn matrix_out<'py>(
-    py: Python<'py>,
+fn matrix_out(
+    py: Python<'_>,
     data: Vec<f64>,
     rows: usize,
     cols: usize,
-) -> PyResult<Bound<'py, PyArray2<f64>>> {
+) -> PyResult<Bound<'_, PyArray2<f64>>> {
     let array = Array2::from_shape_vec((rows, cols), data)
         .map_err(|err| value_error(format!("could not shape the result: {err}")))?;
     Ok(array.to_pyarray(py))
@@ -81,9 +81,11 @@ fn output_frequencies(freq_in: &[f64], freq_out: Option<Vec<f64>>) -> Vec<f64> {
 /// freq_out : array-like, optional
 ///     Frequencies at which to write the smooth. Defaults to ``freq_in``.
 /// method : {"approx", "exact"}, optional
-///     ``"approx"`` keeps frequencies inside ``10**(±3/b)``. ``"exact"`` sums
-///     the published window over every positive frequency. Default is
-///     ``"approx"``.
+///     ``"approx"`` keeps frequencies with ``|b log10(f / fc)| <= 3`` and
+///     evaluates the window with a polynomial. An output frequency with no
+///     input sample in that range uses the full exact window instead.
+///     ``"exact"`` sums the published window over every positive frequency.
+///     Default is ``"approx"``.
 /// n_cores : int or None, optional
 ///     How many cores to use. ``None`` uses every logical CPU. Default is 1.
 #[pyfunction]
@@ -118,7 +120,8 @@ fn smooth<'py>(
 ///
 /// Build this once when many spectra share ``freq_in``, ``freq_out``, and
 /// ``bandwidth``. :meth:`apply` and :meth:`apply_many` only multiply those
-/// stored weights.
+/// stored weights. An ``"approx"`` frequency with no input sample inside the
+/// cutoff stores the full exact window for that row.
 #[pyclass(name = "PrecomputedWeights")]
 struct PrecomputedWeights {
     plan: Arc<Plan>,

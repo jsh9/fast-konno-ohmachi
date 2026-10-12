@@ -46,7 +46,8 @@ def _reference(signal, freq_in, freq_out, bandwidth, method):
     """Published window, summed in NumPy.
 
     ``approx`` keeps samples with ``|b log10(f / fc)| <= 3 + 1e-9``, the same
-    cutoff the convolution kernel uses.
+    cutoff the convolution kernel uses. An output with no sample in that
+    range uses the full exact window.
     """
     signal = np.asarray(signal, dtype=np.float64).ravel()
     freq_in = np.asarray(freq_in, dtype=np.float64).ravel()
@@ -57,6 +58,8 @@ def _reference(signal, freq_in, freq_out, bandwidth, method):
         x = bandwidth * (log_in - np.log10(fc))
         if method == "approx":
             keep = np.abs(x) <= 3.0 + 1e-9
+            if not np.any(keep):
+                keep = np.ones(freq_in.shape, dtype=bool)
         else:
             keep = np.ones(freq_in.shape, dtype=bool)
         weights = np.zeros_like(x)
@@ -103,6 +106,24 @@ def test_float32_weights_stay_close():
     weights = ko.PrecomputedWeights(freq, bandwidth=40, dtype="float32")
     cached = weights.apply(spec)
     np.testing.assert_allclose(cached, direct, rtol=1e-5, atol=1e-8)
+
+
+def test_empty_approx_window_uses_the_exact_sum():
+    freq = np.arange(1.0, 11.0)
+    freq_out = np.array([1.5, 2.0, 5.5])
+    constant = ko.smooth(np.ones(freq.size), freq, bandwidth=100, freq_out=freq_out)
+    assert np.isfinite(constant).all()
+    np.testing.assert_allclose(constant, 1.0)
+
+    signal = np.linspace(0.2, 1.7, freq.size)
+    approx = ko.smooth(signal, freq, bandwidth=100, freq_out=freq_out, method="approx")
+    exact = ko.smooth(signal, freq, bandwidth=100, freq_out=freq_out, method="exact")
+    assert np.isfinite(approx).all()
+    np.testing.assert_allclose(approx[[0, 2]], exact[[0, 2]], rtol=1e-12, atol=1e-12)
+    reference = _reference(signal, freq, freq_out, 100, "approx")
+    np.testing.assert_allclose(approx, reference, rtol=1e-8, atol=1e-10)
+    weights = ko.PrecomputedWeights(freq, bandwidth=100, freq_out=freq_out, method="approx")
+    np.testing.assert_allclose(weights.apply(signal), approx, rtol=1e-12, atol=1e-12)
 
 
 @pytest.mark.parametrize("bandwidth", [20, 30, 60, 100])

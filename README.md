@@ -45,7 +45,7 @@ coarse = np.linspace(freq[0], freq[-1], 400)
 smoothed = ko.smooth(signal, freq, bandwidth=40, freq_out=coarse)
 ```
 
-`method="approx"` (the default) keeps frequencies inside `10**(±3/b)` and evaluates the window with a polynomial. `method="exact"` sums the published window over every positive frequency.
+`method="approx"` (the default) keeps frequencies with `|b log10(f / fc)| <= 3` and evaluates the window with a polynomial. If an output frequency has no input sample in that range, that one output uses the full exact window. `method="exact"` sums the published window over every positive frequency.
 
 `n_cores` is how many cores to use. The default for `smooth` is 1. `None` uses every logical CPU. The workers are ordinary threads; they are not pinned to cores.
 
