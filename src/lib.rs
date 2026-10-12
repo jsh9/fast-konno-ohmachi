@@ -23,10 +23,7 @@ fn as_f64_1d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
     let numpy = py.import("numpy")?;
     let array = numpy.call_method1("asarray", (obj,))?;
     let flat = array.call_method0("ravel")?;
-    let contiguous = numpy.call_method1(
-        "ascontiguousarray",
-        (flat, numpy.getattr("float64")?),
-    )?;
+    let contiguous = numpy.call_method1("ascontiguousarray", (flat, numpy.getattr("float64")?))?;
     let typed = contiguous.cast::<PyArray1<f64>>()?;
     typed
         .to_vec()
@@ -42,10 +39,7 @@ fn as_f64_2d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usiz
             "signals must be a 2-D array of shape (n_records, n_freq)",
         ));
     }
-    let contiguous = numpy.call_method1(
-        "ascontiguousarray",
-        (array, numpy.getattr("float64")?),
-    )?;
+    let contiguous = numpy.call_method1("ascontiguousarray", (array, numpy.getattr("float64")?))?;
     let typed = contiguous.cast::<PyArray2<f64>>()?;
     let dims = typed.dims();
     let data = typed

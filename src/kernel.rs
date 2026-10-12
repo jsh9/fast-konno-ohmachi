@@ -1,6 +1,6 @@
 //! Konno-Ohmachi smoothing kernels.
 //!
-//! `method="approx"` keeps frequencies inside `10^(±3/b)`. `method="exact"`
+//! `method="approx"` keeps samples with `|b log10(f / fc)| <= 3`. `method="exact"`
 //! sums the published window over every positive frequency.
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -262,19 +262,19 @@ fn pointwise(
     n_cores: usize,
 ) -> Vec<f64> {
     let log_in: Vec<f64> = freq_in.iter().map(|f| f.log10()).collect();
-    let max_ratio = 10f64.powf(3.0 / bandwidth);
-    let min_ratio = 1.0 / max_ratio;
     let mut out = vec![0.0; freq_out.len()];
     for_each_chunk(n_cores, &mut out, &|part, offset| {
         for (local, dest) in part.iter_mut().enumerate() {
             let fc = freq_out[offset + local];
             let log_fc = fc.log10();
             let (lo, hi) = if method == Method::Approx {
-                window_bounds(freq_in, fc, min_ratio, max_ratio)
+                window_bounds(&log_in, log_fc, bandwidth)
             } else {
                 (0, freq_in.len())
             };
-            *dest = normalized_sum(signal, freq_in, &log_in, lo, hi, fc, log_fc, bandwidth, method);
+            *dest = normalized_sum(
+                signal, freq_in, &log_in, lo, hi, fc, log_fc, bandwidth, method,
+            );
         }
     });
     out
@@ -314,8 +314,6 @@ fn build_sparse(
     dtype: DType,
 ) -> Result<Kind, String> {
     let log_in: Vec<f64> = freq_in.iter().map(|f| f.log10()).collect();
-    let max_ratio = 10f64.powf(3.0 / bandwidth);
-    let min_ratio = 1.0 / max_ratio;
     let mut col0 = Vec::with_capacity(freq_out.len());
     let mut start = Vec::with_capacity(freq_out.len() + 1);
     let mut raw: Vec<f64> = Vec::new();
@@ -323,14 +321,21 @@ fn build_sparse(
     for &fc in freq_out {
         let log_fc = fc.log10();
         let (lo, hi) = if method == Method::Approx {
-            window_bounds(freq_in, fc, min_ratio, max_ratio)
+            window_bounds(&log_in, log_fc, bandwidth)
         } else {
             (0, freq_in.len())
         };
         let row_at = raw.len();
         let mut weight_sum = 0.0;
         for j in lo..hi {
-            let weight = weight_at(freq_in[j], log_in[j], fc, log_fc, bandwidth, method == Method::Approx);
+            let weight = weight_at(
+                freq_in[j],
+                log_in[j],
+                fc,
+                log_fc,
+                bandwidth,
+                method == Method::Approx,
+            );
             raw.push(weight);
             weight_sum += weight;
         }
@@ -344,7 +349,8 @@ fn build_sparse(
             }
             col0.push(u32::try_from(lo).map_err(|_| "frequency grid is too long".to_string())?);
         }
-        let end = u32::try_from(raw.len()).map_err(|_| "precomputed weights are too large".to_string())?;
+        let end = u32::try_from(raw.len())
+            .map_err(|_| "precomputed weights are too large".to_string())?;
         start.push(end);
     }
     Ok(Kind::Sparse {
@@ -381,20 +387,21 @@ impl Values {
     }
 }
 
-fn window_bounds(freq_in: &[f64], fc: f64, min_ratio: f64, max_ratio: f64) -> (usize, usize) {
-    let lo = freq_in.partition_point(|value| *value < fc * min_ratio);
-    let hi = freq_in.partition_point(|value| *value <= fc * max_ratio);
+/// Half-width of the approx window in `x = b * log10(f / fc)`.
+const X_CUTOFF: f64 = 3.0;
+/// Keeps a sample that lands on the cutoff in exact arithmetic, whether `x` is
+/// reached through log10 differences or through `lag * du`.
+const X_TOL: f64 = 1e-9;
+
+/// Indices `[lo, hi)` of `log_in` whose `|b * (log_in - log_fc)| <= X_CUTOFF + X_TOL`.
+fn window_bounds(log_in: &[f64], log_fc: f64, bandwidth: f64) -> (usize, usize) {
+    let edge = X_CUTOFF + X_TOL;
+    let lo = log_in.partition_point(|&value| bandwidth * (value - log_fc) < -edge);
+    let hi = log_in.partition_point(|&value| bandwidth * (value - log_fc) <= edge);
     (lo, hi)
 }
 
-fn weight_at(
-    freq: f64,
-    log_freq: f64,
-    fc: f64,
-    log_fc: f64,
-    bandwidth: f64,
-    approx: bool,
-) -> f64 {
+fn weight_at(freq: f64, log_freq: f64, fc: f64, log_fc: f64, bandwidth: f64, approx: bool) -> f64 {
     if (freq - fc).abs() <= f64::EPSILON * fc.max(1.0) {
         return 1.0;
     }
@@ -405,11 +412,7 @@ fn window_from_x(x: f64, approx: bool) -> f64 {
     if x.abs() < 1e-12 {
         return 1.0;
     }
-    let sinc = if approx {
-        sinc_taylor(x)
-    } else {
-        x.sin() / x
-    };
+    let sinc = if approx { sinc_taylor(x) } else { x.sin() / x };
     let squared = sinc * sinc;
     squared * squared
 }
@@ -451,7 +454,7 @@ fn log_spacing(freq: &[f64]) -> Option<f64> {
 }
 
 fn approx_kernel(bandwidth: f64, du: f64) -> Vec<f64> {
-    let half = ((3.0 / bandwidth) / du + 1e-9).floor() as usize;
+    let half = ((X_CUTOFF + X_TOL) / (bandwidth * du)).floor() as usize;
     let mut kernel = Vec::with_capacity(2 * half + 1);
     for index in 0..=(2 * half) {
         let lag = index as isize - half as isize;
@@ -522,20 +525,43 @@ mod tests {
         assert!(log_spacing(&freq).is_none());
     }
 
-    #[test]
-    fn log_grid_convolution_matches_pointwise() {
-        let freq: Vec<f64> = (0..80).map(|i| 10f64.powf(-1.0 + i as f64 * 0.05)).collect();
+    fn assert_log_grid_matches(freq: Vec<f64>, bandwidth: f64) {
         let signal: Vec<f64> = freq.iter().map(|f| (f.ln().sin()).powi(2) + 0.2).collect();
-        let via_point = pointwise(&freq, &freq, &signal, 40.0, Method::Approx, 1);
-        let via_smooth = smooth_signal(&freq, &freq, &signal, 40.0, Method::Approx, 1).unwrap();
-        let plan = build_plan(freq.clone(), freq.clone(), 40.0, Method::Approx, DType::F64).unwrap();
+        let via_point = pointwise(&freq, &freq, &signal, bandwidth, Method::Approx, 1);
+        let via_smooth =
+            smooth_signal(&freq, &freq, &signal, bandwidth, Method::Approx, 1).unwrap();
+        let plan = build_plan(
+            freq.clone(),
+            freq.clone(),
+            bandwidth,
+            Method::Approx,
+            DType::F64,
+        )
+        .unwrap();
         assert!(matches!(plan.kind, Kind::Convolution { .. }));
         let via_plan = apply_plan(&plan, &signal, 2).unwrap();
         for ((&point, &smooth), &cached) in via_point.iter().zip(&via_smooth).zip(&via_plan) {
             let scale = point.abs().max(1.0);
-            assert!((smooth - point).abs() <= 1e-8 * scale, "{smooth} {point}");
-            assert!((cached - smooth).abs() <= 1e-12 * scale, "{cached} {smooth}");
+            assert!(
+                (smooth - point).abs() <= 1e-8 * scale,
+                "{smooth} {point} bandwidth={bandwidth}"
+            );
+            assert!(
+                (cached - smooth).abs() <= 1e-12 * scale,
+                "{cached} {smooth}"
+            );
         }
+    }
+
+    #[test]
+    fn log_grid_convolution_matches_pointwise() {
+        let freq: Vec<f64> = (0..80)
+            .map(|i| 10f64.powf(-1.0 + i as f64 * 0.05))
+            .collect();
+        assert_log_grid_matches(freq, 40.0);
+        // 3 / (b * du) = 10 exactly, so the cutoff tap is the interesting one.
+        let freq: Vec<f64> = (0..201).map(|i| 10f64.powf(i as f64 * 0.01)).collect();
+        assert_log_grid_matches(freq, 30.0);
     }
 
     #[test]

@@ -43,19 +43,22 @@ def _assert_close(expected, actual, thres):
 
 
 def _reference(signal, freq_in, freq_out, bandwidth, method):
-    """Published window, summed in NumPy. ``approx`` keeps ``10**(±3/b)``."""
+    """Published window, summed in NumPy.
+
+    ``approx`` keeps samples with ``|b log10(f / fc)| <= 3 + 1e-9``, the same
+    cutoff the convolution kernel uses.
+    """
     signal = np.asarray(signal, dtype=np.float64).ravel()
     freq_in = np.asarray(freq_in, dtype=np.float64).ravel()
     freq_out = np.asarray(freq_out, dtype=np.float64).ravel()
     log_in = np.log10(freq_in)
-    max_ratio = 10 ** (3.0 / bandwidth)
     out = np.empty(freq_out.shape, dtype=np.float64)
     for i, fc in enumerate(freq_out):
+        x = bandwidth * (log_in - np.log10(fc))
         if method == "approx":
-            keep = (freq_in >= fc / max_ratio) & (freq_in <= fc * max_ratio)
+            keep = np.abs(x) <= 3.0 + 1e-9
         else:
             keep = np.ones(freq_in.shape, dtype=bool)
-        x = bandwidth * (log_in - np.log10(fc))
         weights = np.zeros_like(x)
         weights[keep] = 1.0
         nonzero = keep & (np.abs(x) >= 1e-12)
@@ -100,6 +103,18 @@ def test_float32_weights_stay_close():
     weights = ko.PrecomputedWeights(freq, bandwidth=40, dtype="float32")
     cached = weights.apply(spec)
     np.testing.assert_allclose(cached, direct, rtol=1e-5, atol=1e-8)
+
+
+@pytest.mark.parametrize("bandwidth", [20, 30, 60, 100])
+def test_window_edge_is_consistent_on_integer_tap_grids(bandwidth):
+    freq = np.logspace(0, 2, 201)
+    signal = np.sin(np.log(freq)) ** 2 + 0.3
+    direct = ko.smooth(signal, freq, bandwidth=bandwidth)
+    weights = ko.PrecomputedWeights(freq, bandwidth=bandwidth, freq_out=freq[:-1])
+    cached = weights.apply(signal)
+    np.testing.assert_allclose(direct[:-1], cached, rtol=1e-12, atol=1e-12)
+    reference = _reference(signal, freq, freq, bandwidth, "approx")
+    np.testing.assert_allclose(direct, reference, rtol=1e-8, atol=1e-8)
 
 
 def test_log_grid_smooth_matches_precomputed_weights():
