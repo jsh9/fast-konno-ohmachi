@@ -1,0 +1,17 @@
+[package]
+name = "fast_konno_ohmachi"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+description = "Konno-Ohmachi spectral smoothing"
+repository = "https://github.com/jsh9/fast-konno-ohmachi"
+homepage = "https://github.com/jsh9/fast-konno-ohmachi"
+publish = false
+
+[lib]
+name = "fast_konno_ohmachi"
+crate-type = ["cdylib"]
+
+[dependencies]
+numpy = "0.29"
+pyo3 = { version = "0.29", features = ["abi3-py310"] }

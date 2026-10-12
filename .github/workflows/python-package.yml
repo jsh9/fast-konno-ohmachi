@@ -1,40 +1,127 @@
-# This workflow will install Python dependencies, run tests and lint with a variety of Python versions
-# For more information see: https://help.github.com/actions/language-and-framework-guides/using-python-with-github-actions
-
 name: Python package
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
 
 jobs:
   build:
-
-    runs-on: ubuntu-latest
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.7", "3.8", "3.9", "3.10"]
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            manylinux: auto
+            portable: true
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            manylinux: auto
+            portable: true
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            portable: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            portable: false
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            portable: false
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            portable: false
 
     steps:
-    - uses: actions/checkout@v3
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v3
-      with:
-        python-version: ${{ matrix.python-version }}
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        python -m pip install flake8 pytest flake8-commas
-        if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
-        python -m pip install -e .
-    - name: Lint with flake8
-      run: |
-        flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-        flake8 . --count --statistics --max-line-length=88
-    - name: Test with pytest
-      run: |
-        python -m pip install -r requirements-test.txt
-        pytest
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Choose the Python 3.10 interpreter
+        shell: bash
+        run: |
+          # Linux builds run inside the manylinux container, which has python3.10.
+          # Elsewhere, point maturin at the interpreter setup-python installed.
+          # Copying python.exe off to the side breaks the Windows layout, so keep
+          # the real path.
+          if command -v python3.10 >/dev/null 2>&1; then
+            echo "PYTHON_INTERPRETER=python3.10" >> "$GITHUB_ENV"
+          elif [ -n "${pythonLocation:-}" ] && [ -x "$pythonLocation/python.exe" ]; then
+            interp="${pythonLocation}/python.exe"
+            interp=$(printf '%s' "$interp" | sed 's|\\|/|g')
+            echo "PYTHON_INTERPRETER=$interp" >> "$GITHUB_ENV"
+          elif [ -n "${pythonLocation:-}" ] && [ -x "$pythonLocation/python" ]; then
+            echo "PYTHON_INTERPRETER=$pythonLocation/python" >> "$GITHUB_ENV"
+          else
+            echo "PYTHON_INTERPRETER=$(command -v python)" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build the Linux wheel
+        if: matrix.portable
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i python3.10
+          manylinux: ${{ matrix.manylinux }}
+
+      - name: Build the wheel
+        if: ${{ !matrix.portable }}
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          args: --release --out dist -i ${{ env.PYTHON_INTERPRETER }}
+
+      - name: Install the wheel and run pytest
+        shell: bash
+        run: |
+          python -m venv .venv
+          if [ -f .venv/bin/activate ]; then
+            source .venv/bin/activate
+          else
+            source .venv/Scripts/activate
+          fi
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python -m pip install -r requirements-test.txt
+          python -c "import fast_konno_ohmachi as ko; assert callable(ko.smooth)"
+          pytest
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel-${{ matrix.target }}
+          path: dist/*.whl
+
+  test-py313:
+    name: abi3 wheel on Python 3.13
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Download the Linux x86_64 wheel
+        uses: actions/download-artifact@v4
+        with:
+          name: wheel-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Install the wheel and run pytest
+        run: |
+          python -m venv .venv
+          source .venv/bin/activate
+          python -m pip install --upgrade pip
+          python -m pip install dist/*.whl
+          python -m pip install -r requirements-test.txt
+          python -c "import sys, fast_konno_ohmachi as ko; assert sys.version_info[:2] == (3, 13); assert callable(ko.smooth)"
+          pytest

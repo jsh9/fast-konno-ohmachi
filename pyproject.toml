@@ -1,0 +1,30 @@
+[build-system]
+requires = ["maturin>=1.8,<2"]
+build-backend = "maturin"
+
+[project]
+name = "fast-konno-ohmachi"
+version = "0.2.0"
+description = "Konno-Ohmachi spectral smoothing"
+readme = "README.md"
+license = { file = "LICENSE.txt" }
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Rust",
+]
+keywords = ["konno-ohmachi", "smoothing", "seismology", "spectrum"]
+
+[project.urls]
+Homepage = "https://github.com/jsh9/fast-konno-ohmachi"
+
+[tool.maturin]
+features = ["pyo3/extension-module"]
+module-name = "fast_konno_ohmachi"
