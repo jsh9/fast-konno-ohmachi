@@ -87,7 +87,8 @@ fn output_frequencies(freq_in: &[f64], freq_out: Option<Vec<f64>>) -> Vec<f64> {
 ///     ``"exact"`` sums the published window over every positive frequency.
 ///     Default is ``"approx"``.
 /// n_cores : int or None, optional
-///     How many cores to use. ``None`` uses every logical CPU. Default is 1.
+///     How many cores to use. ``None`` uses every logical CPU. A value above
+///     that count is an error. Default is 1.
 #[pyfunction]
 #[pyo3(signature = (signal, freq_in, bandwidth=40.0, *, freq_out=None, method="approx", n_cores=1))]
 fn smooth<'py>(
@@ -177,7 +178,7 @@ impl PrecomputedWeights {
     /// Apply the stored weights to a batch of spectra.
     ///
     /// ``signals`` has shape ``(n_records, n_freq)``. ``n_cores`` defaults to
-    /// every logical CPU.
+    /// every logical CPU. A value above that count is an error.
     #[pyo3(signature = (signals, n_cores=None))]
     fn apply_many<'py>(
         &self,

@@ -64,12 +64,16 @@ pub fn parse_dtype(dtype: &str) -> Result<DType, String> {
 }
 
 pub fn resolve_cores(n_cores: Option<isize>) -> Result<usize, String> {
+    let available = std::thread::available_parallelism()
+        .map(|count| count.get())
+        .unwrap_or(1);
     match n_cores {
-        None => Ok(std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)),
-        Some(n) if n >= 1 => Ok(n as usize),
-        Some(n) => Err(format!("n_cores must be >= 1 or None, got {n}")),
+        None => Ok(available),
+        Some(n) if n >= 1 && (n as usize) <= available => Ok(n as usize),
+        Some(n) if n < 1 => Err(format!("n_cores must be >= 1 or None, got {n}")),
+        Some(n) => Err(format!(
+            "n_cores ({n}) exceeds the {available} logical CPUs on this machine"
+        )),
     }
 }
 
@@ -617,6 +621,18 @@ mod tests {
             let scale = exact[index].abs().max(1.0);
             assert!((approx[index] - exact[index]).abs() <= 1e-12 * scale);
         }
+    }
+
+    #[test]
+    fn rejects_more_cores_than_the_machine_has() {
+        let available = std::thread::available_parallelism()
+            .map(|count| count.get())
+            .unwrap_or(1);
+        assert_eq!(resolve_cores(None).unwrap(), available);
+        assert_eq!(resolve_cores(Some(1)).unwrap(), 1);
+        let err = resolve_cores(Some(available as isize + 1)).unwrap_err();
+        assert!(err.contains("n_cores"), "{err}");
+        assert!(resolve_cores(Some(0)).unwrap_err().contains("n_cores"));
     }
 
     #[test]

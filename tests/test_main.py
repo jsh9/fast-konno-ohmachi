@@ -236,6 +236,20 @@ def test_bad_bandwidth_raises(bandwidth):
         ko.smooth(signal, freq, bandwidth=bandwidth)
 
 
+def test_n_cores_above_the_machine_raises():
+    freq = np.arange(1, 8, dtype=np.float64)
+    signal = np.ones_like(freq)
+    weights = ko.PrecomputedWeights(freq, bandwidth=40)
+    rows = np.vstack([signal, signal])
+    for call in (
+        lambda n_cores: ko.smooth(signal, freq, n_cores=n_cores),
+        lambda n_cores: weights.apply(signal, n_cores=n_cores),
+        lambda n_cores: weights.apply_many(rows, n_cores=n_cores),
+    ):
+        with pytest.raises(ValueError, match="n_cores"):
+            call(10**6)
+
+
 def test_bad_method_dtype_cores_and_shapes_raise():
     freq = np.arange(1, 8, dtype=np.float64)
     signal = np.ones_like(freq)
