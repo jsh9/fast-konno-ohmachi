@@ -120,7 +120,7 @@ pub fn build_plan(
     let kind = if method == Method::Approx && same_grid(&freq_in, &freq_out) {
         if let Some(du) = log_spacing(&freq_in) {
             Kind::Convolution {
-                kernel: store_values(&approx_kernel(bandwidth, du), dtype)?,
+                kernel: store_values(&approx_kernel(bandwidth, du, freq_in.len())?, dtype)?,
             }
         } else {
             build_sparse(&freq_in, &freq_out, bandwidth, method, dtype)?
@@ -157,7 +157,7 @@ pub fn smooth_signal(
     }
     if method == Method::Approx && same_grid(freq_in, freq_out) {
         if let Some(du) = log_spacing(freq_in) {
-            return convolve(signal, &approx_kernel(bandwidth, du));
+            return convolve(signal, &approx_kernel(bandwidth, du, freq_in.len())?);
         }
     }
     pointwise(freq_in, freq_out, signal, bandwidth, method, n_cores)
@@ -483,14 +483,43 @@ fn log_spacing(freq: &[f64]) -> Option<f64> {
     first
 }
 
-fn approx_kernel(bandwidth: f64, du: f64) -> Vec<f64> {
-    let half = ((X_CUTOFF + X_TOL) / (bandwidth * du)).floor() as usize;
-    let mut kernel = Vec::with_capacity(2 * half + 1);
-    for index in 0..=(2 * half) {
+/// Approx window on a log grid with step `du`, as lags `-half..=half`.
+///
+/// Only lags up to `n_in - 1` can pair two of `n_in` samples, so `half` is
+/// capped there. That keeps a tiny `bandwidth * du` from asking for an
+/// unbounded kernel.
+fn approx_kernel(bandwidth: f64, du: f64, n_in: usize) -> Result<Vec<f64>, String> {
+    let max_half = n_in.saturating_sub(1);
+    let step = bandwidth * du;
+    let half = if step == 0.0 {
+        max_half
+    } else if step.is_infinite() {
+        0
+    } else {
+        let width = (X_CUTOFF + X_TOL) / step;
+        if !width.is_finite() || width >= max_half as f64 {
+            max_half
+        } else {
+            width.floor() as usize
+        }
+    };
+    let len = half
+        .checked_mul(2)
+        .and_then(|taps| taps.checked_add(1))
+        .ok_or_else(|| "convolution kernel is too long".to_string())?;
+    let mut kernel = Vec::new();
+    kernel
+        .try_reserve_exact(len)
+        .map_err(|_| format!("could not allocate a {len}-tap convolution kernel"))?;
+    for index in 0..len {
+        if index == half {
+            kernel.push(1.0);
+            continue;
+        }
         let lag = index as isize - half as isize;
         kernel.push(window_from_x(bandwidth * (lag as f64) * du, true));
     }
-    kernel
+    Ok(kernel)
 }
 
 fn convolve(signal: &[f64], kernel: &[f64]) -> Result<Vec<f64>, String> {
@@ -591,6 +620,62 @@ mod tests {
         // 3 / (b * du) = 10 exactly, so the cutoff tap is the interesting one.
         let freq: Vec<f64> = (0..201).map(|i| 10f64.powf(i as f64 * 0.01)).collect();
         assert_log_grid_matches(freq, 30.0);
+        // The uncapped half-width would be 150 taps on a 50-sample grid.
+        let freq: Vec<f64> = (0..50).map(|i| 10f64.powf(i as f64 * 0.02)).collect();
+        assert_log_grid_matches(freq, 1.0);
+    }
+
+    fn assert_bounded_kernel(kernel: &[f64], n_in: usize) {
+        assert!(kernel.len() < 2 * n_in, "{} taps", kernel.len());
+        assert_eq!(kernel.len() % 2, 1);
+        assert_eq!(kernel[kernel.len() / 2], 1.0);
+        assert!(kernel.iter().all(|weight| weight.is_finite()));
+    }
+
+    #[test]
+    fn kernel_is_capped_by_the_grid_length() {
+        let kernel = approx_kernel(1e-20, 1e-6, 5).unwrap();
+        assert_bounded_kernel(&kernel, 5);
+        assert_eq!(kernel.len(), 9);
+        assert_eq!(approx_kernel(1e-20, 1e-6, 1).unwrap(), vec![1.0]);
+        // 3 / (b * du) = 10, below the cap of 199.
+        let kernel = approx_kernel(30.0, 0.01, 200).unwrap();
+        assert_bounded_kernel(&kernel, 200);
+        assert_eq!(kernel.len(), 21);
+    }
+
+    #[test]
+    fn kernel_survives_step_underflow_and_overflow() {
+        let smallest = f64::from_bits(1);
+        assert_eq!(smallest * 0.25, 0.0);
+        let kernel = approx_kernel(smallest, 0.25, 7).unwrap();
+        assert_bounded_kernel(&kernel, 7);
+        assert_eq!(kernel.len(), 13);
+
+        // Finite step whose reciprocal overflows.
+        let step = 1e-310;
+        assert!(((X_CUTOFF + X_TOL) / step).is_infinite());
+        let kernel = approx_kernel(step, 1.0, 4).unwrap();
+        assert_bounded_kernel(&kernel, 4);
+        assert_eq!(kernel.len(), 7);
+
+        assert!((1e300 * 1e10_f64).is_infinite());
+        assert_eq!(approx_kernel(1e300, 1e10, 3).unwrap(), vec![1.0]);
+    }
+
+    #[test]
+    fn tiny_bandwidth_on_a_log_grid_averages_every_sample() {
+        let freq = vec![1.0, 10.0, 100.0];
+        let signal = vec![1.0, 2.0, 3.0];
+        let direct = smooth_signal(&freq, &freq, &signal, 1e-20, Method::Approx, 1).unwrap();
+        let exact = smooth_signal(&freq, &freq, &signal, 1e-20, Method::Exact, 1).unwrap();
+        for (value, reference) in direct.iter().zip(&exact) {
+            assert!((value - 2.0).abs() < 1e-12, "{value}");
+            assert!((value - reference).abs() < 1e-12, "{value} {reference}");
+        }
+        let plan = build_plan(freq.clone(), freq, 1e-20, Method::Approx, DType::F32).unwrap();
+        let cached = apply_plan(&plan, &signal, 1).unwrap();
+        assert!(cached.iter().all(|value| (value - 2.0).abs() < 1e-6));
     }
 
     #[test]

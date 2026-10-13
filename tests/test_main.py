@@ -138,6 +138,41 @@ def test_window_edge_is_consistent_on_integer_tap_grids(bandwidth):
     np.testing.assert_allclose(direct, reference, rtol=1e-8, atol=1e-8)
 
 
+CACHE_DTYPES = [("float64", 1e-12), ("float32", 1e-6)]
+
+
+@pytest.mark.parametrize("dtype, rtol", CACHE_DTYPES)
+def test_tiny_bandwidth_on_a_log_grid_averages_every_sample(dtype, rtol):
+    freq = np.array([1.0, 10.0, 100.0])
+    signal = np.array([1.0, 2.0, 3.0])
+    direct = ko.smooth(signal, freq, bandwidth=1e-20)
+    exact = ko.smooth(signal, freq, bandwidth=1e-20, method="exact")
+    assert np.isfinite(direct).all()
+    np.testing.assert_allclose(direct, 2.0, rtol=1e-12)
+    np.testing.assert_allclose(direct, exact, rtol=1e-12)
+
+    weights = ko.PrecomputedWeights(freq, bandwidth=1e-20, dtype=dtype)
+    np.testing.assert_allclose(weights.apply(signal), direct, rtol=rtol)
+    batch = weights.apply_many(np.vstack([signal, signal[::-1]]))
+    np.testing.assert_allclose(batch, np.vstack([direct, direct]), rtol=rtol)
+
+
+@pytest.mark.parametrize("bandwidth", [1e-20, 0.05, 1.0, 5.0])
+def test_window_wider_than_the_grid_matches_pointwise(bandwidth):
+    # Same log-uniform grid in and out, so smooth takes the convolution path.
+    freq = np.logspace(0, 1, 50)
+    signal = np.sin(np.log(freq)) ** 2 + 0.3
+    direct = ko.smooth(signal, freq, bandwidth=bandwidth)
+    reference = _reference(signal, freq, freq, bandwidth, "approx")
+    np.testing.assert_allclose(direct, reference, rtol=1e-8, atol=1e-10)
+
+    pointwise = ko.PrecomputedWeights(freq, bandwidth=bandwidth, freq_out=freq[:-1])
+    np.testing.assert_allclose(direct[:-1], pointwise.apply(signal), rtol=1e-12, atol=1e-12)
+    for dtype, rtol in CACHE_DTYPES:
+        cached = ko.PrecomputedWeights(freq, bandwidth=bandwidth, dtype=dtype)
+        np.testing.assert_allclose(cached.apply(signal), direct, rtol=rtol)
+
+
 def test_log_grid_smooth_matches_precomputed_weights():
     freq = np.logspace(-2, 2, 500)
     signal = np.sin(np.log(freq)) ** 2 + 0.3
