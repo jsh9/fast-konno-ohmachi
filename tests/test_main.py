@@ -310,6 +310,78 @@ def test_column_vectors_are_accepted():
     np.testing.assert_array_equal(column, flat)
 
 
+def _unaligned(values):
+    """Copy ``values`` into a C-contiguous float64 array that is not aligned."""
+    values = np.asarray(values, dtype=np.float64)
+    buffer = bytearray(values.nbytes + 8)
+    base = np.frombuffer(buffer, dtype=np.uint8).ctypes.data
+    offset = next(k for k in range(1, 8) if (base + k) % values.itemsize)
+    out = np.ndarray(values.shape, dtype=np.float64, buffer=buffer, offset=offset)
+    out[...] = values
+    assert out.flags.c_contiguous
+    assert not out.flags.aligned
+    return out
+
+
+def test_unaligned_inputs_match_aligned_copies():
+    rng = np.random.default_rng(3)
+    freq = np.sort(rng.uniform(0.5, 20.0, 40))
+    freq_out = np.linspace(1.0, 18.0, 15)
+    signal = rng.uniform(0.1, 2.0, freq.size)
+    expected = ko.smooth(signal, freq, bandwidth=10, freq_out=freq_out)
+
+    for name in ("signal", "freq_in", "freq_out"):
+        args = {"signal": signal, "freq_in": freq, "freq_out": freq_out}
+        args[name] = _unaligned(args[name])
+        before = args[name].copy()
+        result = ko.smooth(args["signal"], args["freq_in"], 10, freq_out=args["freq_out"])
+        np.testing.assert_array_equal(result, expected)
+        np.testing.assert_array_equal(args[name], before)
+
+    weights = ko.PrecomputedWeights(_unaligned(freq), 10, freq_out=_unaligned(freq_out))
+    reference = ko.PrecomputedWeights(freq, 10, freq_out=freq_out)
+    np.testing.assert_array_equal(weights.apply(_unaligned(signal)), reference.apply(signal))
+
+    rows = np.vstack([signal, signal[::-1], np.sqrt(signal)])
+    unaligned_rows = _unaligned(rows)
+    batch = weights.apply_many(unaligned_rows)
+    assert batch.shape == (3, freq_out.size)
+    np.testing.assert_array_equal(batch, reference.apply_many(rows))
+    np.testing.assert_array_equal(unaligned_rows, rows)
+    for row, smoothed in zip(rows, batch):
+        np.testing.assert_array_equal(smoothed, reference.apply(row))
+
+
+def test_unusual_array_layouts_match_plain_copies():
+    rng = np.random.default_rng(5)
+    freq = np.sort(rng.uniform(0.5, 20.0, 41))
+    signal = rng.uniform(0.1, 2.0, freq.size)
+    weights = ko.PrecomputedWeights(freq, bandwidth=12)
+    expected = weights.apply(signal)
+
+    strided = np.empty(2 * freq.size)
+    strided[::2] = signal
+    read_only = signal.copy()
+    read_only.flags.writeable = False
+    variants = (strided[::2], read_only, signal.astype(">f8"), signal[::-1], signal.astype(np.float32))
+    for variant in variants:
+        plain = np.array(variant, dtype=np.float64)
+        assert plain.flags.c_contiguous and plain.flags.aligned
+        np.testing.assert_array_equal(weights.apply(variant), weights.apply(plain))
+        np.testing.assert_array_equal(ko.smooth(variant, freq, 12), ko.smooth(plain, freq, 12))
+    np.testing.assert_array_equal(weights.apply(strided[::2]), expected)
+
+    rows = np.vstack([signal, signal[::-1], signal * 2])
+    fortran = np.asfortranarray(rows)
+    assert not fortran.flags.c_contiguous
+    np.testing.assert_array_equal(weights.apply_many(fortran), weights.apply_many(rows))
+
+    empty = weights.apply_many(np.empty((0, freq.size)))
+    assert empty.shape == (0, freq.size)
+    single = weights.apply_many(signal[None, :])
+    np.testing.assert_array_equal(single[0], expected)
+
+
 @pytest.mark.parametrize(
     "freq",
     [

@@ -19,11 +19,24 @@ fn value_error(message: impl ToString) -> PyErr {
     PyValueError::new_err(message.to_string())
 }
 
+/// `numpy.require(array, float64, ["C", "A"])`: C-contiguous, aligned, native
+/// float64. A contiguous array can still be misaligned (a byte buffer with an
+/// odd offset), and `to_vec` rejects that, so contiguity alone is not enough.
+fn require_f64<'py>(
+    numpy: &Bound<'py, PyModule>,
+    array: Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyAny>> {
+    numpy.call_method1(
+        "require",
+        (array, numpy.getattr("float64")?, vec!["C", "A"]),
+    )
+}
+
 fn as_f64_1d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
     let numpy = py.import("numpy")?;
     let array = numpy.call_method1("asarray", (obj,))?;
     let flat = array.call_method0("ravel")?;
-    let contiguous = numpy.call_method1("ascontiguousarray", (flat, numpy.getattr("float64")?))?;
+    let contiguous = require_f64(&numpy, flat)?;
     let typed = contiguous.cast::<PyArray1<f64>>()?;
     typed
         .to_vec()
@@ -39,7 +52,7 @@ fn as_f64_2d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usiz
             "signals must be a 2-D array of shape (n_records, n_freq)",
         ));
     }
-    let contiguous = numpy.call_method1("ascontiguousarray", (array, numpy.getattr("float64")?))?;
+    let contiguous = require_f64(&numpy, array)?;
     let typed = contiguous.cast::<PyArray2<f64>>()?;
     let dims = typed.dims();
     let data = typed
