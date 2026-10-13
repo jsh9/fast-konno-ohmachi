@@ -173,6 +173,73 @@ def test_window_wider_than_the_grid_matches_pointwise(bandwidth):
         np.testing.assert_allclose(cached.apply(signal), direct, rtol=rtol)
 
 
+def _two_sample_window(bandwidth, method):
+    x = bandwidth * np.log10(2.0)
+    if method == "approx" and abs(x) > 3.0:
+        return 0.0
+    return (np.sin(x) / x) ** 4
+
+
+@pytest.mark.parametrize("scale", [1.0, 1e-20])
+@pytest.mark.parametrize("bandwidth, method", [(40, "exact"), (2, "exact"), (2, "approx")])
+def test_two_close_small_frequencies_keep_their_window(scale, bandwidth, method):
+    freq = np.array([1.0, 2.0]) * scale
+    signal = np.array([0.0, 1.0])
+    neighbor = _two_sample_window(bandwidth, method)
+    expected = np.array([neighbor, 1.0]) / (1.0 + neighbor)
+
+    direct = ko.smooth(signal, freq, bandwidth=bandwidth, method=method)
+    np.testing.assert_allclose(direct, expected, rtol=1e-9, atol=1e-15)
+    for dtype, rtol in CACHE_DTYPES:
+        weights = ko.PrecomputedWeights(freq, bandwidth=bandwidth, method=method, dtype=dtype)
+        np.testing.assert_allclose(weights.apply(signal), expected, rtol=max(rtol, 1e-9), atol=1e-7)
+        batch = weights.apply_many(np.vstack([signal, signal[::-1]]))
+        np.testing.assert_allclose(
+            batch, np.vstack([expected, expected[::-1]]), rtol=max(rtol, 1e-9), atol=1e-7
+        )
+
+
+@pytest.mark.parametrize("method", ["approx", "exact"])
+def test_smoothing_is_invariant_to_frequency_scale(method):
+    rng = np.random.default_rng(7)
+    freq = np.sort(rng.uniform(0.5, 20.0, 60))
+    freq_out = np.sort(rng.uniform(0.6, 19.0, 25))
+    signal = rng.uniform(0.1, 2.0, freq.size)
+    base = ko.smooth(signal, freq, bandwidth=8, freq_out=freq_out, method=method)
+    base_same = ko.smooth(signal, freq, bandwidth=8, method=method)
+    for scale in [1e-20, 1e-6, 1e3, 1e20]:
+        scaled = ko.smooth(signal, freq * scale, bandwidth=8, freq_out=freq_out * scale, method=method)
+        np.testing.assert_allclose(scaled, base, rtol=1e-9, atol=1e-12)
+        same = ko.smooth(signal, freq * scale, bandwidth=8, method=method)
+        np.testing.assert_allclose(same, base_same, rtol=1e-9, atol=1e-12)
+        for dtype, rtol in CACHE_DTYPES:
+            weights = ko.PrecomputedWeights(
+                freq * scale, bandwidth=8, freq_out=freq_out * scale, method=method, dtype=dtype
+            )
+            np.testing.assert_allclose(weights.apply(signal), base, rtol=max(rtol, 1e-9))
+
+
+def test_log_grid_is_invariant_to_frequency_scale():
+    freq = np.logspace(0, 2, 120)
+    signal = np.sin(np.log(freq)) ** 2 + 0.3
+    base = ko.smooth(signal, freq, bandwidth=20)
+    for scale in [1e-20, 1e20]:
+        direct = ko.smooth(signal, freq * scale, bandwidth=20)
+        np.testing.assert_allclose(direct, base, rtol=1e-9)
+        pointwise = ko.PrecomputedWeights(freq * scale, bandwidth=20, freq_out=freq[:-1] * scale)
+        np.testing.assert_allclose(pointwise.apply(signal), direct[:-1], rtol=1e-9)
+
+
+@pytest.mark.parametrize("scale", [1.0, 1e-20])
+def test_single_sample_and_constant_signal_survive_small_frequencies(scale):
+    for method in ("approx", "exact"):
+        single = ko.smooth([5.0], [scale], method=method)
+        np.testing.assert_array_equal(single, [5.0])
+        freq = np.array([1.0, 1.5, 4.0, 9.0]) * scale
+        constant = ko.smooth(np.full(freq.size, 2.5), freq, bandwidth=2, method=method)
+        np.testing.assert_allclose(constant, 2.5, rtol=1e-12)
+
+
 def test_log_grid_smooth_matches_precomputed_weights():
     freq = np.logspace(-2, 2, 500)
     signal = np.sin(np.log(freq)) ** 2 + 0.3

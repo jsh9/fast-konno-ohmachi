@@ -431,8 +431,10 @@ fn row_window(log_in: &[f64], log_fc: f64, bandwidth: f64, method: Method) -> (u
     (0, log_in.len(), false)
 }
 
+/// The window depends only on `f / fc`, so the center shortcut must not use an
+/// absolute tolerance in hertz; `window_from_x` handles `x` near zero.
 fn weight_at(freq: f64, log_freq: f64, fc: f64, log_fc: f64, bandwidth: f64, approx: bool) -> f64 {
-    if (freq - fc).abs() <= f64::EPSILON * fc.max(1.0) {
+    if freq == fc {
         return 1.0;
     }
     window_from_x(bandwidth * (log_freq - log_fc), approx)
@@ -705,6 +707,23 @@ mod tests {
         for index in [0, 2] {
             let scale = exact[index].abs().max(1.0);
             assert!((approx[index] - exact[index]).abs() <= 1e-12 * scale);
+        }
+    }
+
+    #[test]
+    fn center_weight_does_not_depend_on_the_frequency_scale() {
+        for approx in [false, true] {
+            let reference = weight_at(2.0, 2f64.log10(), 1.0, 0.0, 2.0, approx);
+            assert!(reference < 1.0);
+            for scale in [1e-20, 1e-300, 1e20] {
+                let (freq, fc) = (2.0 * scale, scale);
+                let weight = weight_at(freq, freq.log10(), fc, fc.log10(), 2.0, approx);
+                assert!(
+                    (weight - reference).abs() <= 1e-12,
+                    "scale={scale} {weight} {reference}"
+                );
+                assert_eq!(weight_at(fc, fc.log10(), fc, fc.log10(), 2.0, approx), 1.0);
+            }
         }
     }
 
