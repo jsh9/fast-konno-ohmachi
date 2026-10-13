@@ -21,6 +21,21 @@ NATIVE_THRESHOLDS = [
 ]
 
 
+def _accepts_n_cores(n_cores):
+    try:
+        ko.smooth([1.0, 2.0, 3.0], [1.0, 2.0, 3.0], n_cores=n_cores)
+    except ValueError:
+        return False
+    return True
+
+
+# An explicit n_cores above the logical CPU count is an error, so two workers
+# only run where the host has them. n_cores=None works everywhere.
+TWO_CORES = pytest.param(
+    2, marks=pytest.mark.skipif(not _accepts_n_cores(2), reason="needs two logical CPUs")
+)
+
+
 def _load_spectrum():
     data = sio.loadmat(SPECTRUM.as_posix())
     freq = np.ravel(data["freq"]).astype(np.float64)
@@ -84,8 +99,8 @@ def test_precomputed_weights_match_smooth_for_two_spectra():
     other = np.sqrt(spec)
     weights = ko.PrecomputedWeights(freq, bandwidth=40, method="approx")
     for signal in (spec, other):
-        direct = ko.smooth(signal, freq, bandwidth=40, method="approx", n_cores=2)
-        cached = weights.apply(signal, n_cores=2)
+        direct = ko.smooth(signal, freq, bandwidth=40, method="approx", n_cores=None)
+        cached = weights.apply(signal, n_cores=None)
         np.testing.assert_allclose(cached, direct, rtol=1e-9, atol=1e-12)
 
 
@@ -245,7 +260,7 @@ def test_log_grid_smooth_matches_precomputed_weights():
     signal = np.sin(np.log(freq)) ** 2 + 0.3
     direct = ko.smooth(signal, freq, bandwidth=30, method="approx")
     weights = ko.PrecomputedWeights(freq, bandwidth=30, method="approx")
-    cached = weights.apply(signal, n_cores=2)
+    cached = weights.apply(signal, n_cores=None)
     np.testing.assert_allclose(cached, direct, rtol=1e-12, atol=1e-12)
 
     reference = _reference(signal, freq, freq, 30, "approx")
@@ -256,7 +271,7 @@ def test_exact_matches_published_sum_on_a_short_grid():
     freq = np.linspace(0.2, 12.0, 90)
     signal = np.cos(freq) ** 2 + 0.1
     for method in ("exact", "approx"):
-        direct = ko.smooth(signal, freq, bandwidth=15.5, method=method, n_cores=2)
+        direct = ko.smooth(signal, freq, bandwidth=15.5, method=method, n_cores=None)
         weights = ko.PrecomputedWeights(freq, bandwidth=15.5, method=method)
         cached = weights.apply(signal, n_cores=1)
         reference = _reference(signal, freq, freq, 15.5, method)
@@ -264,27 +279,56 @@ def test_exact_matches_published_sum_on_a_short_grid():
         np.testing.assert_allclose(cached, direct, rtol=1e-9, atol=1e-12)
 
 
-def test_n_cores_do_not_change_the_result():
+@pytest.mark.parametrize("n_cores", [TWO_CORES, None])
+def test_n_cores_do_not_change_the_result(n_cores):
     spec, freq = _load_spectrum()
     one = ko.smooth(spec, freq, bandwidth=40, n_cores=1)
-    two = ko.smooth(spec, freq, bandwidth=40, n_cores=2)
-    np.testing.assert_array_equal(two, one)
+    many = ko.smooth(spec, freq, bandwidth=40, n_cores=n_cores)
+    np.testing.assert_array_equal(many, one)
 
     weights = ko.PrecomputedWeights(freq, bandwidth=40)
-    np.testing.assert_array_equal(weights.apply(spec, n_cores=2), weights.apply(spec, n_cores=1))
+    np.testing.assert_array_equal(
+        weights.apply(spec, n_cores=n_cores), weights.apply(spec, n_cores=1)
+    )
 
 
-def test_apply_many_matches_row_by_row():
+@pytest.mark.parametrize("n_cores", [1, TWO_CORES, None])
+def test_apply_many_matches_row_by_row(n_cores):
     spec, freq = _load_spectrum()
     rows = np.vstack([spec, np.sqrt(spec), spec[::-1], np.full_like(spec, spec.mean())])
     weights = ko.PrecomputedWeights(freq, bandwidth=40)
-    batch = weights.apply_many(rows, n_cores=2)
+    batch = weights.apply_many(rows, n_cores=n_cores)
     assert batch.shape == rows.shape
     for row, smoothed in zip(rows, batch):
-        np.testing.assert_allclose(smoothed, weights.apply(row, n_cores=1), rtol=1e-12, atol=1e-12)
+        np.testing.assert_array_equal(smoothed, weights.apply(row, n_cores=1))
 
     default_batch = weights.apply_many(rows)
     np.testing.assert_array_equal(default_batch, batch)
+
+
+@pytest.mark.parametrize("n_cores", [TWO_CORES, None])
+@pytest.mark.parametrize("bandwidth", [0.5, 7.0, 40.0])
+def test_log_grid_convolution_is_identical_for_any_worker_count(bandwidth, n_cores):
+    # At bandwidth 0.5 the capped kernel spans the whole grid.
+    freq = np.logspace(-1, 1, 2001)
+    signal = np.sin(3 * np.log(freq)) + 1.5
+    serial = ko.smooth(signal, freq, bandwidth, n_cores=1)
+    np.testing.assert_array_equal(ko.smooth(signal, freq, bandwidth, n_cores=n_cores), serial)
+
+    rows = np.vstack([signal, signal[::-1], 2 * signal])
+    for dtype, rtol in CACHE_DTYPES:
+        weights = ko.PrecomputedWeights(freq, bandwidth, dtype=dtype)
+        cached = weights.apply(signal, n_cores=1)
+        np.testing.assert_allclose(cached, serial, rtol=rtol)
+        np.testing.assert_array_equal(weights.apply(signal, n_cores=n_cores), cached)
+
+        batch = weights.apply_many(rows, n_cores=n_cores)
+        for row, smoothed in zip(rows, batch):
+            np.testing.assert_array_equal(smoothed, weights.apply(row, n_cores=1))
+        single = weights.apply_many(signal[None, :], n_cores=n_cores)
+        np.testing.assert_array_equal(single[0], cached)
+        empty = weights.apply_many(np.empty((0, freq.size)), n_cores=n_cores)
+        assert empty.shape == (0, freq.size)
 
 
 def test_endpoints_are_computed():

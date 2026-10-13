@@ -4,6 +4,7 @@
 //! range contains no input sample, that output uses the full exact window.
 //! `method="exact"` sums the published window over every positive frequency.
 
+use std::borrow::Cow;
 use std::sync::Mutex;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,7 +158,10 @@ pub fn smooth_signal(
     }
     if method == Method::Approx && same_grid(freq_in, freq_out) {
         if let Some(du) = log_spacing(freq_in) {
-            return convolve(signal, &approx_kernel(bandwidth, du, freq_in.len())?);
+            let kernel = approx_kernel(bandwidth, du, freq_in.len())?;
+            let mut out = vec![0.0; signal.len()];
+            convolve_into(signal, &kernel, &mut out, n_cores)?;
+            return Ok(out);
         }
     }
     pointwise(freq_in, freq_out, signal, bandwidth, method, n_cores)
@@ -227,8 +231,7 @@ fn apply_into(plan: &Plan, signal: &[f64], out: &mut [f64], n_cores: usize) -> R
     match &plan.kind {
         Kind::Convolution { kernel } => {
             let values = kernel.as_f64();
-            let smoothed = convolve(signal, &values)?;
-            out.copy_from_slice(&smoothed);
+            convolve_into(signal, &values, out, n_cores)?;
         }
         Kind::Sparse {
             col0,
@@ -396,9 +399,9 @@ fn store_values(raw: &[f64], dtype: DType) -> Result<Values, String> {
 }
 
 impl Values {
-    fn as_f64(&self) -> Vec<f64> {
+    fn as_f64(&self) -> Cow<'_, [f64]> {
         match self {
-            Values::F64(values) => values.clone(),
+            Values::F64(values) => Cow::Borrowed(values),
             Values::F32(values) => values.iter().map(|value| f64::from(*value)).collect(),
         }
     }
@@ -524,25 +527,46 @@ fn approx_kernel(bandwidth: f64, du: f64, n_in: usize) -> Result<Vec<f64>, Strin
     Ok(kernel)
 }
 
-fn convolve(signal: &[f64], kernel: &[f64]) -> Result<Vec<f64>, String> {
+/// Normalized convolution of `signal` with a symmetric `kernel` into `out`.
+///
+/// Workers split the outputs; each output sums its taps in increasing sample
+/// order, so the result does not depend on `n_cores`.
+fn convolve_into(
+    signal: &[f64],
+    kernel: &[f64],
+    out: &mut [f64],
+    n_cores: usize,
+) -> Result<(), String> {
+    let n = signal.len();
     let half = kernel.len() / 2;
-    let mut out = vec![0.0; signal.len()];
-    for (i, dest) in out.iter_mut().enumerate() {
-        let mut total = 0.0;
-        let mut weight_sum = 0.0;
-        for (k, &weight) in kernel.iter().enumerate() {
-            let index = i as isize + k as isize - half as isize;
-            if index >= 0 && (index as usize) < signal.len() {
-                total += weight * signal[index as usize];
+    let failure = Mutex::new(None);
+    for_each_chunk(n_cores, out, &|part, offset| {
+        for (local, dest) in part.iter_mut().enumerate() {
+            let i = offset + local;
+            // Taps k with 0 <= i + k - half < n.
+            let k_lo = half.saturating_sub(i);
+            let k_hi = kernel.len().min(n + half - i);
+            let taps = &kernel[k_lo..k_hi];
+            let first = i + k_lo - half;
+            let samples = &signal[first..first + taps.len()];
+            let mut total = 0.0;
+            let mut weight_sum = 0.0;
+            for (&weight, &value) in taps.iter().zip(samples) {
+                total += weight * value;
                 weight_sum += weight;
             }
+            if weight_sum == 0.0 {
+                *failure.lock().expect("window error lock") =
+                    Some("Konno-Ohmachi window summed to zero".to_string());
+                continue;
+            }
+            *dest = total / weight_sum;
         }
-        if weight_sum == 0.0 {
-            return Err("Konno-Ohmachi window summed to zero".to_string());
-        }
-        *dest = total / weight_sum;
+    });
+    if let Some(err) = failure.into_inner().expect("window error lock") {
+        return Err(err);
     }
-    Ok(out)
+    Ok(())
 }
 
 fn for_each_chunk(n_cores: usize, out: &mut [f64], f: &(impl Fn(&mut [f64], usize) + Sync)) {
@@ -707,6 +731,30 @@ mod tests {
         for index in [0, 2] {
             let scale = exact[index].abs().max(1.0);
             assert!((approx[index] - exact[index]).abs() <= 1e-12 * scale);
+        }
+    }
+
+    #[test]
+    fn log_grid_convolution_is_identical_for_any_worker_count() {
+        let freq: Vec<f64> = (0..301).map(|i| 10f64.powf(i as f64 / 300.0)).collect();
+        let signal: Vec<f64> = freq.iter().map(|f| (f.ln() * 3.0).sin() + 1.5).collect();
+        // 0.5 spans the whole grid; 40 is a short kernel.
+        for bandwidth in [0.5, 7.0, 40.0] {
+            let serial =
+                smooth_signal(&freq, &freq, &signal, bandwidth, Method::Approx, 1).unwrap();
+            for dtype in [DType::F64, DType::F32] {
+                let plan = build_plan(freq.clone(), freq.clone(), bandwidth, Method::Approx, dtype)
+                    .unwrap();
+                assert!(matches!(plan.kind, Kind::Convolution { .. }));
+                let cached = apply_plan(&plan, &signal, 1).unwrap();
+                for n_cores in [2, 3, 7, 301, 1000] {
+                    let direct =
+                        smooth_signal(&freq, &freq, &signal, bandwidth, Method::Approx, n_cores)
+                            .unwrap();
+                    assert_eq!(direct, serial, "bandwidth={bandwidth} n_cores={n_cores}");
+                    assert_eq!(apply_plan(&plan, &signal, n_cores).unwrap(), cached);
+                }
+            }
         }
     }
 
