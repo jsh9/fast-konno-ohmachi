@@ -158,6 +158,16 @@ pub fn same_grid(freq_in: &[f64], freq_out: &[f64]) -> bool {
     freq_in.len() == freq_out.len() && freq_in.iter().zip(freq_out).all(|(a, b)| a == b)
 }
 
+/// The log step when `method="approx"` can run as a convolution: the output
+/// grid is the input grid and that grid is log-uniform.
+fn convolution_spacing(freq_in: &[f64], freq_out: &[f64], method: Method) -> Option<f64> {
+    if method == Method::Approx && same_grid(freq_in, freq_out) {
+        log_spacing(freq_in)
+    } else {
+        None
+    }
+}
+
 pub fn build_plan(
     freq_in: Vec<f64>,
     freq_out: Vec<f64>,
@@ -168,16 +178,11 @@ pub fn build_plan(
     validate_freq(&freq_in, "freq_in")?;
     validate_freq(&freq_out, "freq_out")?;
     validate_bandwidth(bandwidth)?;
-    let kind = if method == Method::Approx && same_grid(&freq_in, &freq_out) {
-        if let Some(du) = log_spacing(&freq_in) {
-            Kind::Convolution {
-                kernel: store_values(approx_kernel(bandwidth, du, freq_in.len())?, dtype),
-            }
-        } else {
-            build_sparse(&freq_in, &freq_out, bandwidth, method, dtype)?
-        }
-    } else {
-        build_sparse(&freq_in, &freq_out, bandwidth, method, dtype)?
+    let kind = match convolution_spacing(&freq_in, &freq_out, method) {
+        Some(du) => Kind::Convolution {
+            kernel: store_values(approx_kernel(bandwidth, du, freq_in.len())?, dtype),
+        },
+        None => build_sparse(&freq_in, &freq_out, bandwidth, method, dtype)?,
     };
     Ok(Plan {
         freq_in,
@@ -207,13 +212,11 @@ pub fn smooth_signal(
             freq_in.len()
         )));
     }
-    if method == Method::Approx && same_grid(freq_in, freq_out) {
-        if let Some(du) = log_spacing(freq_in) {
-            let kernel = approx_kernel(bandwidth, du, freq_in.len())?;
-            let mut out = vec![0.0; signal.len()];
-            convolve_into(signal, &kernel, &mut out, n_cores)?;
-            return Ok(out);
-        }
+    if let Some(du) = convolution_spacing(freq_in, freq_out, method) {
+        let kernel = approx_kernel(bandwidth, du, freq_in.len())?;
+        let mut out = vec![0.0; signal.len()];
+        convolve_into(signal, &kernel, &mut out, n_cores)?;
+        return Ok(out);
     }
     pointwise(freq_in, freq_out, signal, bandwidth, method, n_cores)
 }

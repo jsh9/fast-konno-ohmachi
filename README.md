@@ -47,7 +47,7 @@ smoothed = ko.smooth(signal, freq, bandwidth=40, freq_out=coarse)
 
 `method="approx"` (the default) keeps frequencies with `|b log10(f / fc)| <= 3` and evaluates the window with a polynomial. If an output frequency has no input sample in that range, that one output uses the full exact window. `method="exact"` sums the published window over every positive frequency.
 
-`n_cores` is how many cores to use. The default for `smooth` is 1. `None` uses every logical CPU, and a larger value is an error. The workers are ordinary threads; they are not pinned to cores.
+`n_cores` is how many cores to use. The default for `smooth` is 1. `None` uses every logical CPU available to the process, which under a container CPU quota can be fewer than the machine has, and a larger value raises `ValueError`. The workers are ordinary threads; they are not pinned to cores.
 
 ```python
 smoothed = ko.smooth(signal, freq, bandwidth=40, n_cores=None)
