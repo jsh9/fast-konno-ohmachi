@@ -8,17 +8,29 @@ import scipy.io as sio
 
 import fast_konno_ohmachi as ko
 
-
 SPECTRUM = Path(__file__).resolve().parents[1] / "demo" / "spectrum.mat"
 
+# NumPy 2 renamed trapz to trapezoid; the wheel runs on NumPy 1.x as well.
+_trapezoid = getattr(np, "trapezoid", None) or np.trapz
+
 # Pointwise error of method="approx" against method="exact", as a fraction of
-# the peak of the exact smooth. These are the thresholds the previous
-# interpolating implementation was held to on the native Tohoku record.
+# the peak of the exact smooth, on the Tohoku record in demo/. The measured
+# gap is 1.5e-3 to 1.9e-3 for bandwidths 20 to 80 and 4.0e-3 at 10; these are
+# about 2.5 times that, so a change that doubles the truncation error fails.
 NATIVE_THRESHOLDS = [
-    (80, 0.07),
-    (60, 0.06),
-    (40, 0.03),
-    (20, 0.02),
+    (80, 0.004),
+    (60, 0.004),
+    (40, 0.004),
+    (20, 0.005),
+    (10, 0.01),
+]
+
+# The same gap on every 2nd, 5th and 10th sample of that record stays below
+# 2e-3 for bandwidths 20 to 80 and below 4.5e-3 at 10.
+DOWNSAMPLED_THRESHOLDS = [
+    (80, 0.005),
+    (40, 0.005),
+    (20, 0.005),
     (10, 0.01),
 ]
 
@@ -50,8 +62,8 @@ def _assert_close(expected, actual, thres):
     actual = np.asarray(actual, dtype=np.float64).ravel()
     assert expected.shape == actual.shape
 
-    area_actual = np.trapezoid(actual)
-    area_expected = np.trapezoid(expected)
+    area_actual = _trapezoid(actual)
+    area_expected = _trapezoid(expected)
     assert abs(area_actual - area_expected) / abs(area_expected) <= 0.005
 
     relative = np.abs(actual - expected) / np.max(expected)
@@ -91,6 +103,16 @@ def _reference(signal, freq_in, freq_out, bandwidth, method):
 @pytest.mark.parametrize("bandwidth, thres", NATIVE_THRESHOLDS)
 def test_approx_matches_exact_on_native_record(bandwidth, thres):
     spec, freq = _load_spectrum()
+    exact = ko.smooth(spec, freq, bandwidth, method="exact", n_cores=None)
+    approx = ko.smooth(spec, freq, bandwidth=bandwidth, method="approx", n_cores=1)
+    _assert_close(expected=exact, actual=approx, thres=thres)
+
+
+@pytest.mark.parametrize("step", [2, 5, 10])
+@pytest.mark.parametrize("bandwidth, thres", DOWNSAMPLED_THRESHOLDS)
+def test_approx_matches_exact_on_downsampled_record(step, bandwidth, thres):
+    spec, freq = _load_spectrum()
+    spec, freq = spec[::step], freq[::step]
     exact = ko.smooth(spec, freq, bandwidth, method="exact", n_cores=None)
     approx = ko.smooth(spec, freq, bandwidth=bandwidth, method="approx", n_cores=1)
     _assert_close(expected=exact, actual=approx, thres=thres)
@@ -281,6 +303,19 @@ def test_exact_matches_published_sum_on_a_short_grid():
         np.testing.assert_allclose(cached, direct, rtol=1e-9, atol=1e-12)
 
 
+def test_exact_with_freq_out_matches_published_sum():
+    freq = np.linspace(0.2, 12.0, 90)
+    freq_out = freq[::7]
+    signal = np.cos(freq) ** 2 + 0.1
+    reference = _reference(signal, freq, freq_out, 15.5, "exact")
+    direct = ko.smooth(signal, freq, bandwidth=15.5, freq_out=freq_out, method="exact")
+    np.testing.assert_allclose(direct, reference, rtol=1e-8, atol=1e-10)
+    weights = ko.PrecomputedWeights(freq, bandwidth=15.5, freq_out=freq_out, method="exact")
+    np.testing.assert_allclose(weights.apply(signal), reference, rtol=1e-8, atol=1e-10)
+    batch = weights.apply_many(np.vstack([signal, 2 * signal]))
+    np.testing.assert_allclose(batch[1], 2 * reference, rtol=1e-8, atol=1e-10)
+
+
 @pytest.mark.parametrize("n_cores", [TWO_CORES, None])
 def test_n_cores_do_not_change_the_result(n_cores):
     spec, freq = _load_spectrum()
@@ -429,7 +464,7 @@ def test_unusual_array_layouts_match_plain_copies():
 
 
 def test_precomputed_weights_report_their_parameters():
-    spec, freq = _load_spectrum()
+    _, freq = _load_spectrum()
     weights = ko.PrecomputedWeights(freq, bandwidth=25.5, freq_out=freq[::50], dtype="float32")
     assert ko.PrecomputedWeights.__module__ == "fast_konno_ohmachi"
     assert weights.bandwidth == 25.5
