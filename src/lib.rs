@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use numpy::ndarray::Array2;
-use numpy::{PyArray1, PyArray2, PyArrayMethods, ToPyArray};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
@@ -27,52 +27,67 @@ fn kernel_error(err: KernelError) -> PyErr {
     }
 }
 
+fn unreadable(err: impl ToString) -> PyErr {
+    value_error(format!(
+        "could not read a numeric array: {}",
+        err.to_string()
+    ))
+}
+
 /// `numpy.require(array, float64, ["C", "A"])`: C-contiguous, aligned, native
-/// float64. A contiguous array can still be misaligned (a byte buffer with an
-/// odd offset), and `to_vec` rejects that, so contiguity alone is not enough.
-fn require_f64<'py>(
-    numpy: &Bound<'py, PyModule>,
-    array: Bound<'py, PyAny>,
+/// float64, flattened first when `flatten` is set. A contiguous array can
+/// still be misaligned (a byte buffer with an odd offset), so contiguity alone
+/// is not enough. The result is a view of `obj` when it already qualifies, so
+/// the kernel reads the caller's buffer without a copy.
+fn f64_array<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+    flatten: bool,
 ) -> PyResult<Bound<'py, PyAny>> {
+    let numpy = py.import("numpy")?;
+    let mut array = numpy.call_method1("asarray", (obj,))?;
+    if flatten {
+        array = array.call_method0("ravel")?;
+    }
     numpy.call_method1(
         "require",
         (array, numpy.getattr("float64")?, vec!["C", "A"]),
     )
 }
 
-fn as_f64_1d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
-    let numpy = py.import("numpy")?;
-    let array = numpy.call_method1("asarray", (obj,))?;
-    let flat = array.call_method0("ravel")?;
-    let contiguous = require_f64(&numpy, flat)?;
-    let typed = contiguous.cast::<PyArray1<f64>>()?;
-    typed
-        .to_vec()
-        .map_err(|err| value_error(format!("could not read a numeric array: {err}")))
+fn f64_array_1d<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyArray1<f64>>> {
+    f64_array(py, obj, true)?
+        .cast_into::<PyArray1<f64>>()
+        .map_err(unreadable)
 }
 
-fn as_f64_2d(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<(Vec<f64>, usize, usize)> {
-    let numpy = py.import("numpy")?;
-    let array = numpy.call_method1("asarray", (obj,))?;
+fn f64_array_2d<'py>(
+    py: Python<'py>,
+    obj: &Bound<'py, PyAny>,
+) -> PyResult<Bound<'py, PyArray2<f64>>> {
+    let array = f64_array(py, obj, false)?;
     let ndim: usize = array.getattr("ndim")?.extract()?;
     if ndim != 2 {
         return Err(value_error(
             "signals must be a 2-D array of shape (n_records, n_freq)",
         ));
     }
-    let contiguous = require_f64(&numpy, array)?;
-    let typed = contiguous.cast::<PyArray2<f64>>()?;
-    let dims = typed.dims();
-    let data = typed
-        .to_vec()
-        .map_err(|err| value_error(format!("could not read signals: {err}")))?;
-    Ok((data, dims[0], dims[1]))
+    array.cast_into::<PyArray2<f64>>().map_err(unreadable)
+}
+
+/// Owned copy of a 1-D array, for values the plan keeps.
+fn as_f64_vec(py: Python<'_>, obj: &Bound<'_, PyAny>) -> PyResult<Vec<f64>> {
+    f64_array_1d(py, obj)?.to_vec().map_err(unreadable)
 }
 
 fn vector_out(py: Python<'_>, data: Vec<f64>) -> Bound<'_, PyArray1<f64>> {
     PyArray1::from_vec(py, data)
 }
 
+/// Hand the result to NumPy without copying it.
 fn matrix_out(
     py: Python<'_>,
     data: Vec<f64>,
@@ -81,11 +96,7 @@ fn matrix_out(
 ) -> PyResult<Bound<'_, PyArray2<f64>>> {
     let array = Array2::from_shape_vec((rows, cols), data)
         .map_err(|err| value_error(format!("could not shape the result: {err}")))?;
-    Ok(array.to_pyarray(py))
-}
-
-fn output_frequencies(freq_in: &[f64], freq_out: Option<Vec<f64>>) -> Vec<f64> {
-    freq_out.unwrap_or_else(|| freq_in.to_vec())
+    Ok(array.into_pyarray(py))
 }
 
 /// Smooth one spectrum with the Konno-Ohmachi window.
@@ -108,8 +119,8 @@ fn output_frequencies(freq_in: &[f64], freq_out: Option<Vec<f64>>) -> Vec<f64> {
 ///     ``"exact"`` sums the published window over every positive frequency.
 ///     Default is ``"approx"``.
 /// n_cores : int or None, optional
-///     How many cores to use. ``None`` uses every logical CPU. A value above
-///     that count is an error. Default is 1.
+///     How many cores to use. ``None`` uses every logical CPU available to
+///     the process. A value above that count is an error. Default is 1.
 #[pyfunction]
 #[pyo3(signature = (signal, freq_in, bandwidth=40.0, *, freq_out=None, method="approx", n_cores=1))]
 fn smooth<'py>(
@@ -121,19 +132,18 @@ fn smooth<'py>(
     method: &str,
     n_cores: Option<isize>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let signal = as_f64_1d(py, signal)?;
-    let freq_in = as_f64_1d(py, freq_in)?;
+    let signal = f64_array_1d(py, signal)?;
+    let signal = signal.readonly();
+    let signal = signal.as_slice().map_err(unreadable)?;
+    let freq_in = as_f64_vec(py, freq_in)?;
     let freq_out = match freq_out {
-        Some(values) => Some(as_f64_1d(py, values)?),
-        None => None,
+        Some(values) => as_f64_vec(py, values)?,
+        None => freq_in.clone(),
     };
     let method = parse_method(method).map_err(kernel_error)?;
     let n_cores = resolve_cores(n_cores).map_err(kernel_error)?;
     let smoothed = py
-        .detach(move || {
-            let freq_out = output_frequencies(&freq_in, freq_out);
-            smooth_signal(&freq_in, &freq_out, &signal, bandwidth, method, n_cores)
-        })
+        .detach(|| smooth_signal(&freq_in, &freq_out, signal, bandwidth, method, n_cores))
         .map_err(kernel_error)?;
     Ok(vector_out(py, smoothed))
 }
@@ -161,18 +171,15 @@ impl PrecomputedWeights {
         method: &str,
         dtype: &str,
     ) -> PyResult<Self> {
-        let freq_in = as_f64_1d(py, freq_in)?;
+        let freq_in = as_f64_vec(py, freq_in)?;
         let freq_out = match freq_out {
-            Some(values) => Some(as_f64_1d(py, values)?),
-            None => None,
+            Some(values) => as_f64_vec(py, values)?,
+            None => freq_in.clone(),
         };
         let method = parse_method(method).map_err(kernel_error)?;
         let dtype = parse_dtype(dtype).map_err(kernel_error)?;
         let plan = py
-            .detach(move || {
-                let freq_out = output_frequencies(&freq_in, freq_out);
-                build_plan(freq_in, freq_out, bandwidth, method, dtype)
-            })
+            .detach(move || build_plan(freq_in, freq_out, bandwidth, method, dtype))
             .map_err(kernel_error)?;
         Ok(Self {
             plan: Arc::new(plan),
@@ -187,11 +194,13 @@ impl PrecomputedWeights {
         signal: &Bound<'py, PyAny>,
         n_cores: Option<isize>,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        let signal = as_f64_1d(py, signal)?;
+        let signal = f64_array_1d(py, signal)?;
+        let signal = signal.readonly();
+        let signal = signal.as_slice().map_err(unreadable)?;
         let n_cores = resolve_cores(n_cores).map_err(kernel_error)?;
         let plan = Arc::clone(&self.plan);
         let smoothed = py
-            .detach(move || apply_plan(&plan, &signal, n_cores))
+            .detach(|| apply_plan(&plan, signal, n_cores))
             .map_err(kernel_error)?;
         Ok(vector_out(py, smoothed))
     }
@@ -199,7 +208,8 @@ impl PrecomputedWeights {
     /// Apply the stored weights to a batch of spectra.
     ///
     /// ``signals`` has shape ``(n_records, n_freq)``. ``n_cores`` defaults to
-    /// every logical CPU. A value above that count is an error.
+    /// every logical CPU available to the process. A value above that count
+    /// is an error.
     #[pyo3(signature = (signals, n_cores=None))]
     fn apply_many<'py>(
         &self,
@@ -207,12 +217,20 @@ impl PrecomputedWeights {
         signals: &Bound<'py, PyAny>,
         n_cores: Option<isize>,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
-        let (signals, rows, cols) = as_f64_2d(py, signals)?;
+        let signals = f64_array_2d(py, signals)?;
+        let signals = signals.readonly();
+        let dims = signals.dims();
+        let (rows, cols) = (dims[0], dims[1]);
+        let signals: &[f64] = if signals.is_empty() {
+            &[]
+        } else {
+            signals.as_slice().map_err(unreadable)?
+        };
         let n_cores = resolve_cores(n_cores).map_err(kernel_error)?;
         let plan = Arc::clone(&self.plan);
         let n_out = plan.freq_out.len();
         let smoothed = py
-            .detach(move || apply_many(&plan, &signals, rows, cols, n_cores))
+            .detach(|| apply_many(&plan, signals, rows, cols, n_cores))
             .map_err(kernel_error)?;
         matrix_out(py, smoothed, rows, n_out)
     }

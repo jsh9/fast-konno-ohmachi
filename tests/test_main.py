@@ -426,6 +426,14 @@ def test_unusual_array_layouts_match_plain_copies():
     np.testing.assert_array_equal(single[0], expected)
 
 
+def test_integer_batches_match_float_batches():
+    spec, freq = _load_spectrum()
+    weights = ko.PrecomputedWeights(freq, bandwidth=40)
+    rows = np.vstack([spec, spec[::-1]])
+    counts = np.round(rows * 100.0).astype(np.int32)
+    np.testing.assert_array_equal(weights.apply_many(counts), weights.apply_many(counts.astype(np.float64)))
+    np.testing.assert_array_equal(weights.apply(counts[0]), weights.apply(counts[0].astype(np.float64)))
+
 @pytest.mark.parametrize(
     "freq",
     [
