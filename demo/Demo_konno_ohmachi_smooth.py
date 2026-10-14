@@ -39,7 +39,7 @@ def main():
 
     median = scipy.signal.medfilt(spec, kernel_size=201)
 
-    fig = plt.figure(figsize=(4, 3), dpi=150, edgecolor="k", facecolor="w")
+    plt.figure(figsize=(4, 3), dpi=150, edgecolor="k", facecolor="w")
     ax = plt.axes()
     plt.semilogx(freq, spec, c=[0.5] * 3, lw=0.5, label="Raw signal")
     plt.semilogx(freq, smoothed, "r", lw=1.5, label="Konno-Ohmachi")
