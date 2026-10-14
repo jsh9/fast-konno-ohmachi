@@ -134,7 +134,9 @@ jobs:
           path: dist
           merge-multiple: true
       - name: Publish
-        uses: pypa/gh-action-pypi-publish@27b31702a0e7fc50959f5ad993c78deac1bdfc29
+        # release/v1 is PyPA's maintained tag. The 2021 pin built twine from an
+        # unpinned pip install on Python 3.9 and predates Metadata-Version 2.4.
+        uses: pypa/gh-action-pypi-publish@release/v1
         with:
           user: __token__
           password: ${{ secrets.PYPI_API_TOKEN }}
