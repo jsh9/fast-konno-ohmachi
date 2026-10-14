@@ -34,6 +34,16 @@ pub enum Method {
     Exact,
 }
 
+impl Method {
+    /// The spelling the Python API uses.
+    pub fn name(self) -> &'static str {
+        match self {
+            Method::Approx => "approx",
+            Method::Exact => "exact",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DType {
     F64,
@@ -41,6 +51,14 @@ pub enum DType {
 }
 
 impl DType {
+    /// The NumPy spelling.
+    pub fn name(self) -> &'static str {
+        match self {
+            DType::F64 => "float64",
+            DType::F32 => "float32",
+        }
+    }
+
     fn bytes(self) -> usize {
         match self {
             DType::F64 => std::mem::size_of::<f64>(),
@@ -69,8 +87,6 @@ pub enum Kind {
 }
 
 #[derive(Clone, Debug)]
-// `bandwidth`, `method` and `dtype` are read by the Python getters added later.
-#[allow(dead_code)]
 pub struct Plan {
     pub freq_in: Vec<f64>,
     pub freq_out: Vec<f64>,

@@ -6,7 +6,7 @@ use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyAny;
+use pyo3::types::{PyAny, PyDict};
 
 use crate::kernel::{
     apply_many, apply_plan, build_plan, parse_dtype, parse_method, resolve_cores, smooth_signal,
@@ -14,6 +14,9 @@ use crate::kernel::{
 };
 
 mod kernel;
+
+/// ``(args, kwargs)`` for ``__getnewargs_ex__``.
+type NewArgs<'py> = ((Bound<'py, PyArray1<f64>>, f64), Bound<'py, PyDict>);
 
 fn value_error(message: impl ToString) -> PyErr {
     PyValueError::new_err(message.to_string())
@@ -148,13 +151,35 @@ fn smooth<'py>(
     Ok(vector_out(py, smoothed))
 }
 
+/// ``dtype`` as NumPy spells it: ``"float32"`` for ``np.float32``, a dtype
+/// object, or the string itself. ``None`` is ``"float64"``.
+fn dtype_name(py: Python<'_>, dtype: Option<&Bound<'_, PyAny>>) -> PyResult<String> {
+    let Some(dtype) = dtype else {
+        return Ok("float64".to_string());
+    };
+    if let Ok(name) = dtype.extract::<String>() {
+        return Ok(name);
+    }
+    let numpy = py.import("numpy")?;
+    let dtype = numpy
+        .call_method1("dtype", (dtype,))
+        .map_err(|_| value_error("dtype must be \"float64\" or \"float32\""))?;
+    dtype.getattr("name")?.extract()
+}
+
 /// Weights of the Konno-Ohmachi window for one frequency grid.
 ///
 /// Build this once when many spectra share ``freq_in``, ``freq_out``, and
 /// ``bandwidth``. :meth:`apply` and :meth:`apply_many` only multiply those
 /// stored weights. An ``"approx"`` frequency with no input sample inside the
 /// cutoff stores the full exact window for that row.
-#[pyclass(name = "PrecomputedWeights")]
+///
+/// ``dtype`` is ``"float64"`` or ``"float32"``, as a string or a NumPy dtype,
+/// and sets the precision of the stored weights; results stay float64. The
+/// attributes ``freq_in``, ``freq_out``, ``bandwidth``, ``method`` and
+/// ``dtype`` read back the constructor arguments, and the object pickles and
+/// copies by rebuilding from them.
+#[pyclass(name = "PrecomputedWeights", module = "fast_konno_ohmachi")]
 struct PrecomputedWeights {
     plan: Arc<Plan>,
 }
@@ -162,14 +187,14 @@ struct PrecomputedWeights {
 #[pymethods]
 impl PrecomputedWeights {
     #[new]
-    #[pyo3(signature = (freq_in, bandwidth=40.0, *, freq_out=None, method="approx", dtype="float64"))]
+    #[pyo3(signature = (freq_in, bandwidth=40.0, *, freq_out=None, method="approx", dtype=None))]
     fn new(
         py: Python<'_>,
         freq_in: &Bound<'_, PyAny>,
         bandwidth: f64,
         freq_out: Option<&Bound<'_, PyAny>>,
         method: &str,
-        dtype: &str,
+        dtype: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let freq_in = as_f64_vec(py, freq_in)?;
         let freq_out = match freq_out {
@@ -177,13 +202,63 @@ impl PrecomputedWeights {
             None => freq_in.clone(),
         };
         let method = parse_method(method).map_err(kernel_error)?;
-        let dtype = parse_dtype(dtype).map_err(kernel_error)?;
+        let dtype = parse_dtype(&dtype_name(py, dtype)?).map_err(kernel_error)?;
         let plan = py
             .detach(move || build_plan(freq_in, freq_out, bandwidth, method, dtype))
             .map_err(kernel_error)?;
         Ok(Self {
             plan: Arc::new(plan),
         })
+    }
+
+    /// Frequency of each input sample, in hertz.
+    #[getter]
+    fn freq_in<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_slice(py, &self.plan.freq_in)
+    }
+
+    /// Frequencies at which the smooth is written.
+    #[getter]
+    fn freq_out<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_slice(py, &self.plan.freq_out)
+    }
+
+    /// Konno-Ohmachi bandwidth ``b``.
+    #[getter]
+    fn bandwidth(&self) -> f64 {
+        self.plan.bandwidth
+    }
+
+    /// ``"approx"`` or ``"exact"``.
+    #[getter]
+    fn method(&self) -> &'static str {
+        self.plan.method.name()
+    }
+
+    /// ``"float64"`` or ``"float32"``: the precision of the stored weights.
+    #[getter]
+    fn dtype(&self) -> &'static str {
+        self.plan.dtype.name()
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "PrecomputedWeights(n_in={}, n_out={}, bandwidth={}, method='{}', dtype='{}')",
+            self.plan.freq_in.len(),
+            self.plan.freq_out.len(),
+            self.plan.bandwidth,
+            self.method(),
+            self.dtype()
+        )
+    }
+
+    /// Constructor arguments that rebuild this object, for ``pickle`` and ``copy``.
+    fn __getnewargs_ex__<'py>(&self, py: Python<'py>) -> PyResult<NewArgs<'py>> {
+        let kwargs = PyDict::new(py);
+        kwargs.set_item("freq_out", self.freq_out(py))?;
+        kwargs.set_item("method", self.method())?;
+        kwargs.set_item("dtype", self.dtype())?;
+        Ok(((self.freq_in(py), self.plan.bandwidth), kwargs))
     }
 
     /// Apply the stored weights to one spectrum.

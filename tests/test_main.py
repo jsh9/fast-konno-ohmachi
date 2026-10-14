@@ -1,3 +1,5 @@
+import copy
+import pickle
 from pathlib import Path
 
 import numpy as np
@@ -424,6 +426,56 @@ def test_unusual_array_layouts_match_plain_copies():
     assert empty.shape == (0, freq.size)
     single = weights.apply_many(signal[None, :])
     np.testing.assert_array_equal(single[0], expected)
+
+
+def test_precomputed_weights_report_their_parameters():
+    spec, freq = _load_spectrum()
+    weights = ko.PrecomputedWeights(freq, bandwidth=25.5, freq_out=freq[::50], dtype="float32")
+    assert ko.PrecomputedWeights.__module__ == "fast_konno_ohmachi"
+    assert weights.bandwidth == 25.5
+    assert weights.method == "approx"
+    assert weights.dtype == "float32"
+    np.testing.assert_array_equal(weights.freq_in, freq)
+    np.testing.assert_array_equal(weights.freq_out, freq[::50])
+    assert ko.PrecomputedWeights(freq, method="exact").method == "exact"
+    assert ko.PrecomputedWeights(freq).dtype == "float64"
+    text = repr(weights)
+    assert text.startswith("PrecomputedWeights(")
+    assert "bandwidth=25.5" in text and "method='approx'" in text and "dtype='float32'" in text
+
+
+@pytest.mark.parametrize("dtype", ["float64", "float32"])
+@pytest.mark.parametrize("grid", ["linear", "log"])
+def test_precomputed_weights_survive_pickle_and_copy(dtype, grid):
+    if grid == "linear":
+        spec, freq = _load_spectrum()
+        freq_out = freq[::7]
+    else:
+        freq = np.logspace(-2, 2, 300)
+        freq_out = None
+        spec = np.sin(np.log(freq)) ** 2 + 0.3
+    weights = ko.PrecomputedWeights(freq, bandwidth=30, freq_out=freq_out, dtype=dtype)
+    expected = weights.apply(spec)
+    clones = [pickle.loads(pickle.dumps(weights)), copy.deepcopy(weights), copy.copy(weights)]
+    clones += [
+        pickle.loads(pickle.dumps(weights, protocol))
+        for protocol in range(2, pickle.HIGHEST_PROTOCOL + 1)
+    ]
+    for clone in clones:
+        assert isinstance(clone, ko.PrecomputedWeights)
+        assert clone.dtype == dtype and clone.method == "approx" and clone.bandwidth == 30
+        np.testing.assert_array_equal(clone.freq_out, weights.freq_out)
+        np.testing.assert_array_equal(clone.apply(spec), expected)
+
+
+def test_dtype_accepts_numpy_dtypes():
+    freq = np.arange(1, 8, dtype=np.float64)
+    assert ko.PrecomputedWeights(freq, dtype=np.float32).dtype == "float32"
+    assert ko.PrecomputedWeights(freq, dtype=np.dtype("float64")).dtype == "float64"
+    assert ko.PrecomputedWeights(freq, dtype=float).dtype == "float64"
+    for bad in (np.float16, "int32", 5):
+        with pytest.raises(ValueError):
+            ko.PrecomputedWeights(freq, dtype=bad)
 
 
 def test_integer_batches_match_float_batches():

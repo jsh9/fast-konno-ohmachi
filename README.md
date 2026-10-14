@@ -63,7 +63,7 @@ batch = np.vstack([signal, signal * 0.5])
 many = weights.apply_many(batch)  # n_cores defaults to all logical CPUs
 ```
 
-`PrecomputedWeights` is not callable. `dtype="float32"` stores the cached weights in float32; the arrays returned by `apply` and `apply_many` stay float64.
+`PrecomputedWeights` is not callable. `dtype="float32"` (or `np.float32`) stores the cached weights in float32; the arrays returned by `apply` and `apply_many` stay float64. The attributes `freq_in`, `freq_out`, `bandwidth`, `method` and `dtype` read back the constructor arguments, and the object can be pickled or copied, which rebuilds the weights from them.
 
 With `method="exact"`, `PrecomputedWeights` stores one weight per (input, output) pair: `len(freq_in) * len(freq_out) * 8` bytes, or 4 with `dtype="float32"`. The 15000-point spectrum in `demo/` needs 1.8 GB. A matrix that does not fit raises `MemoryError`, and one with more than 2**32 - 1 weights raises `ValueError`. For a one-off exact smooth use `smooth(method="exact")`, which stores no weights.
 
