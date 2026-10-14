@@ -237,8 +237,11 @@ pub fn apply_many(
     if n_rows == 0 {
         return Ok(flat);
     }
+    // Rows cost the same, so they split evenly across workers. Cores left
+    // over when there are fewer rows than cores split each row instead.
     let workers = n_cores.max(1).min(n_rows);
     let rows_per = n_rows.div_ceil(workers);
+    let inner = (n_cores / workers).max(1);
     let failure = Mutex::new(None);
     std::thread::scope(|scope| {
         for (group, part) in flat.chunks_mut(rows_per * n_out).enumerate() {
@@ -249,7 +252,7 @@ pub fn apply_many(
                 for row in 0..rows_here {
                     let sample = &signals[(row0 + row) * n_cols..(row0 + row + 1) * n_cols];
                     let dest = &mut part[row * n_out..(row + 1) * n_out];
-                    if let Err(err) = apply_into(plan, sample, dest, 1) {
+                    if let Err(err) = apply_into(plan, sample, dest, inner) {
                         *failure.lock().expect("window error lock") = Some(err);
                     }
                 }
@@ -668,6 +671,11 @@ fn convolve_into(
     Ok(())
 }
 
+/// Run `f(part, offset)` over disjoint blocks of `out` on up to `n_cores`
+/// workers. Blocks are handed out as workers free up, so uneven work (the
+/// approx window widens with frequency on a linear grid) still balances.
+/// Each output index is computed by exactly one worker, in a fixed order, so
+/// the result does not depend on the worker count.
 fn for_each_chunk(n_cores: usize, out: &mut [f64], f: &(impl Fn(&mut [f64], usize) + Sync)) {
     let n = out.len();
     let workers = n_cores.max(1).min(n.max(1));
@@ -675,13 +683,19 @@ fn for_each_chunk(n_cores: usize, out: &mut [f64], f: &(impl Fn(&mut [f64], usiz
         f(out, 0);
         return;
     }
-    let chunk = n.div_ceil(workers);
+    // About 32 blocks per worker, and at least 64 outputs per block so the
+    // lock around the block iterator stays negligible.
+    let block = (n / (workers * 32)).clamp(64, 4096);
+    let blocks = Mutex::new(out.chunks_mut(block).enumerate());
     std::thread::scope(|scope| {
-        let mut offset = 0;
-        for part in out.chunks_mut(chunk) {
-            let start = offset;
-            offset += part.len();
-            scope.spawn(move || f(part, start));
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let next = blocks.lock().expect("block iterator lock").next();
+                match next {
+                    Some((index, part)) => f(part, index * block),
+                    None => return,
+                }
+            });
         }
     });
 }
@@ -929,6 +943,39 @@ mod tests {
                 }
             }
             _ => panic!("expected sparse weights"),
+        }
+    }
+
+    #[test]
+    fn for_each_chunk_visits_every_index_once() {
+        for n in [0usize, 1, 63, 64, 65, 1000, 12345] {
+            for workers in [1usize, 2, 3, 8] {
+                let mut out = vec![-1.0; n];
+                for_each_chunk(workers, &mut out, &|part, offset| {
+                    for (j, dest) in part.iter_mut().enumerate() {
+                        *dest = (offset + j) as f64;
+                    }
+                });
+                for (i, &value) in out.iter().enumerate() {
+                    assert_eq!(value, i as f64, "n={n} workers={workers}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn apply_many_uses_spare_cores_on_a_single_row() {
+        let freq: Vec<f64> = (1..=400).map(|i| i as f64 * 0.05).collect();
+        let signal: Vec<f64> = freq.iter().map(|f| f.sin().powi(2) + 0.1).collect();
+        let plan = build_plan(freq.clone(), freq, 20.0, Method::Approx, DType::F64).unwrap();
+        let serial = apply_plan(&plan, &signal, 1).unwrap();
+        let n = signal.len();
+        for n_cores in [1, 2, 3, 8] {
+            assert_eq!(apply_many(&plan, &signal, 1, n, n_cores).unwrap(), serial);
+            let two = [signal.clone(), signal.iter().rev().copied().collect()].concat();
+            let batch = apply_many(&plan, &two, 2, n, n_cores).unwrap();
+            assert_eq!(&batch[..n], &serial[..]);
+            assert_eq!(&batch[n..], &apply_plan(&plan, &two[n..], 1).unwrap()[..]);
         }
     }
 
