@@ -65,6 +65,8 @@ many = weights.apply_many(batch)  # n_cores defaults to all logical CPUs
 
 `PrecomputedWeights` is not callable. `dtype="float32"` stores the cached weights in float32; the arrays returned by `apply` and `apply_many` stay float64.
 
+With `method="exact"`, `PrecomputedWeights` stores one weight per (input, output) pair: `len(freq_in) * len(freq_out) * 8` bytes, or 4 with `dtype="float32"`. The 15000-point spectrum in `demo/` needs 1.8 GB. A matrix that does not fit raises `MemoryError`, and one with more than 2**32 - 1 weights raises `ValueError`. For a one-off exact smooth use `smooth(method="exact")`, which stores no weights.
+
 On a log-uniform grid, with `method="approx"` and `freq_out` left as `freq_in`, both paths use a short convolution instead of a weight per output frequency.
 
 `demo/Demo_konno_ohmachi_smooth.py` smooths the spectrum plotted above. Running it needs `scipy` and `matplotlib`.

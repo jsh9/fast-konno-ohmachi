@@ -468,6 +468,16 @@ def test_n_cores_above_the_machine_raises():
             call(10**6)
 
 
+def test_exact_weights_too_large_raise_before_allocating():
+    # 70000 * 70000 weights exceed what the class can index, so this must fail
+    # before any of them is allocated.
+    freq = np.linspace(1.0, 2.0, 70_000)
+    with pytest.raises(ValueError, match=r'smooth\(method="exact"\)'):
+        ko.PrecomputedWeights(freq, bandwidth=40, method="exact")
+    with pytest.raises(ValueError, match=r'smooth\(method="exact"\)'):
+        ko.PrecomputedWeights(freq, bandwidth=40, method="exact", dtype="float32")
+
+
 def test_bad_method_dtype_cores_and_shapes_raise():
     freq = np.arange(1, 8, dtype=np.float64)
     signal = np.ones_like(freq)

@@ -4,19 +4,27 @@ use std::sync::Arc;
 
 use numpy::ndarray::Array2;
 use numpy::{PyArray1, PyArray2, PyArrayMethods, ToPyArray};
-use pyo3::exceptions::PyValueError;
+use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyAny;
 
 use crate::kernel::{
     apply_many, apply_plan, build_plan, parse_dtype, parse_method, resolve_cores, smooth_signal,
-    Plan,
+    KernelError, Plan,
 };
 
 mod kernel;
 
 fn value_error(message: impl ToString) -> PyErr {
     PyValueError::new_err(message.to_string())
+}
+
+/// Bad arguments raise ``ValueError``; weights that do not fit raise ``MemoryError``.
+fn kernel_error(err: KernelError) -> PyErr {
+    match err {
+        KernelError::Invalid(message) => PyValueError::new_err(message),
+        KernelError::Memory(message) => PyMemoryError::new_err(message),
+    }
 }
 
 /// `numpy.require(array, float64, ["C", "A"])`: C-contiguous, aligned, native
@@ -119,14 +127,14 @@ fn smooth<'py>(
         Some(values) => Some(as_f64_1d(py, values)?),
         None => None,
     };
-    let method = parse_method(method).map_err(value_error)?;
-    let n_cores = resolve_cores(n_cores).map_err(value_error)?;
+    let method = parse_method(method).map_err(kernel_error)?;
+    let n_cores = resolve_cores(n_cores).map_err(kernel_error)?;
     let smoothed = py
         .detach(move || {
             let freq_out = output_frequencies(&freq_in, freq_out);
             smooth_signal(&freq_in, &freq_out, &signal, bandwidth, method, n_cores)
         })
-        .map_err(value_error)?;
+        .map_err(kernel_error)?;
     Ok(vector_out(py, smoothed))
 }
 
@@ -158,14 +166,14 @@ impl PrecomputedWeights {
             Some(values) => Some(as_f64_1d(py, values)?),
             None => None,
         };
-        let method = parse_method(method).map_err(value_error)?;
-        let dtype = parse_dtype(dtype).map_err(value_error)?;
+        let method = parse_method(method).map_err(kernel_error)?;
+        let dtype = parse_dtype(dtype).map_err(kernel_error)?;
         let plan = py
             .detach(move || {
                 let freq_out = output_frequencies(&freq_in, freq_out);
                 build_plan(freq_in, freq_out, bandwidth, method, dtype)
             })
-            .map_err(value_error)?;
+            .map_err(kernel_error)?;
         Ok(Self {
             plan: Arc::new(plan),
         })
@@ -180,11 +188,11 @@ impl PrecomputedWeights {
         n_cores: Option<isize>,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let signal = as_f64_1d(py, signal)?;
-        let n_cores = resolve_cores(n_cores).map_err(value_error)?;
+        let n_cores = resolve_cores(n_cores).map_err(kernel_error)?;
         let plan = Arc::clone(&self.plan);
         let smoothed = py
             .detach(move || apply_plan(&plan, &signal, n_cores))
-            .map_err(value_error)?;
+            .map_err(kernel_error)?;
         Ok(vector_out(py, smoothed))
     }
 
@@ -200,12 +208,12 @@ impl PrecomputedWeights {
         n_cores: Option<isize>,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let (signals, rows, cols) = as_f64_2d(py, signals)?;
-        let n_cores = resolve_cores(n_cores).map_err(value_error)?;
+        let n_cores = resolve_cores(n_cores).map_err(kernel_error)?;
         let plan = Arc::clone(&self.plan);
         let n_out = plan.freq_out.len();
         let smoothed = py
             .detach(move || apply_many(&plan, &signals, rows, cols, n_cores))
-            .map_err(value_error)?;
+            .map_err(kernel_error)?;
         matrix_out(py, smoothed, rows, n_out)
     }
 }

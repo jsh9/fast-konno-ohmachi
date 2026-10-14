@@ -7,6 +7,27 @@
 use std::borrow::Cow;
 use std::sync::Mutex;
 
+/// Why a kernel call could not run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum KernelError {
+    /// Bad arguments. Python sees a `ValueError`.
+    Invalid(String),
+    /// The weights do not fit in memory. Python sees a `MemoryError`.
+    Memory(String),
+}
+
+impl std::fmt::Display for KernelError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            KernelError::Invalid(message) | KernelError::Memory(message) => f.write_str(message),
+        }
+    }
+}
+
+fn invalid(message: impl Into<String>) -> KernelError {
+    KernelError::Invalid(message.into())
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Method {
     Approx,
@@ -17,6 +38,15 @@ pub enum Method {
 pub enum DType {
     F64,
     F32,
+}
+
+impl DType {
+    fn bytes(self) -> usize {
+        match self {
+            DType::F64 => std::mem::size_of::<f64>(),
+            DType::F32 => std::mem::size_of::<f32>(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -39,68 +69,72 @@ pub enum Kind {
 }
 
 #[derive(Clone, Debug)]
+// `bandwidth`, `method` and `dtype` are read by the Python getters added later.
 #[allow(dead_code)]
 pub struct Plan {
     pub freq_in: Vec<f64>,
     pub freq_out: Vec<f64>,
     pub bandwidth: f64,
     pub method: Method,
+    pub dtype: DType,
     pub kind: Kind,
 }
 
-pub fn parse_method(method: &str) -> Result<Method, String> {
+pub fn parse_method(method: &str) -> Result<Method, KernelError> {
     match method {
         "approx" => Ok(Method::Approx),
         "exact" => Ok(Method::Exact),
-        _ => Err("method must be \"approx\" or \"exact\"".to_string()),
+        _ => Err(invalid("method must be \"approx\" or \"exact\"")),
     }
 }
 
-pub fn parse_dtype(dtype: &str) -> Result<DType, String> {
+pub fn parse_dtype(dtype: &str) -> Result<DType, KernelError> {
     match dtype {
         "float64" => Ok(DType::F64),
         "float32" => Ok(DType::F32),
-        _ => Err("dtype must be \"float64\" or \"float32\"".to_string()),
+        _ => Err(invalid("dtype must be \"float64\" or \"float32\"")),
     }
 }
 
-pub fn resolve_cores(n_cores: Option<isize>) -> Result<usize, String> {
+pub fn resolve_cores(n_cores: Option<isize>) -> Result<usize, KernelError> {
     let available = std::thread::available_parallelism()
         .map(|count| count.get())
         .unwrap_or(1);
     match n_cores {
         None => Ok(available),
         Some(n) if n >= 1 && (n as usize) <= available => Ok(n as usize),
-        Some(n) if n < 1 => Err(format!("n_cores must be >= 1 or None, got {n}")),
-        Some(n) => Err(format!(
-            "n_cores ({n}) exceeds the {available} logical CPUs on this machine"
-        )),
+        Some(n) if n < 1 => Err(invalid(format!("n_cores must be >= 1 or None, got {n}"))),
+        Some(n) => Err(invalid(format!(
+            "n_cores ({n}) exceeds the {available} logical CPUs available to this process"
+        ))),
     }
 }
 
-pub fn validate_freq(freq: &[f64], name: &str) -> Result<(), String> {
+pub fn validate_freq(freq: &[f64], name: &str) -> Result<(), KernelError> {
     if freq.is_empty() {
-        return Err(format!("{name} must not be empty"));
+        return Err(invalid(format!("{name} must not be empty")));
     }
     for (i, &value) in freq.iter().enumerate() {
         if !value.is_finite() {
-            return Err(format!("{name}[{i}] must be finite"));
+            return Err(invalid(format!("{name}[{i}] must be finite")));
         }
         if value <= 0.0 {
-            return Err(format!("{name}[{i}] must be positive, got {value}"));
+            return Err(invalid(format!(
+                "{name}[{i}] must be positive, got {value}"
+            )));
         }
         if i > 0 && value <= freq[i - 1] {
-            return Err(format!("{name} must be strictly increasing"));
+            return Err(invalid(format!("{name} must be strictly increasing")));
         }
     }
     Ok(())
 }
 
-pub fn validate_bandwidth(bandwidth: f64) -> Result<(), String> {
+pub fn validate_bandwidth(bandwidth: f64) -> Result<(), KernelError> {
     if bandwidth.is_finite() && bandwidth > 0.0 {
         Ok(())
     } else {
-        Err("bandwidth must be a positive finite number".to_string())
+        Err(invalid("bandwidth must be a positive finite number"))
     }
 }
 
@@ -114,14 +148,14 @@ pub fn build_plan(
     bandwidth: f64,
     method: Method,
     dtype: DType,
-) -> Result<Plan, String> {
+) -> Result<Plan, KernelError> {
     validate_freq(&freq_in, "freq_in")?;
     validate_freq(&freq_out, "freq_out")?;
     validate_bandwidth(bandwidth)?;
     let kind = if method == Method::Approx && same_grid(&freq_in, &freq_out) {
         if let Some(du) = log_spacing(&freq_in) {
             Kind::Convolution {
-                kernel: store_values(&approx_kernel(bandwidth, du, freq_in.len())?, dtype)?,
+                kernel: store_values(approx_kernel(bandwidth, du, freq_in.len())?, dtype),
             }
         } else {
             build_sparse(&freq_in, &freq_out, bandwidth, method, dtype)?
@@ -134,6 +168,7 @@ pub fn build_plan(
         freq_out,
         bandwidth,
         method,
+        dtype,
         kind,
     })
 }
@@ -145,16 +180,16 @@ pub fn smooth_signal(
     bandwidth: f64,
     method: Method,
     n_cores: usize,
-) -> Result<Vec<f64>, String> {
+) -> Result<Vec<f64>, KernelError> {
     validate_freq(freq_in, "freq_in")?;
     validate_freq(freq_out, "freq_out")?;
     validate_bandwidth(bandwidth)?;
     if signal.len() != freq_in.len() {
-        return Err(format!(
+        return Err(invalid(format!(
             "signal length ({}) must match freq_in ({})",
             signal.len(),
             freq_in.len()
-        ));
+        )));
     }
     if method == Method::Approx && same_grid(freq_in, freq_out) {
         if let Some(du) = log_spacing(freq_in) {
@@ -167,13 +202,13 @@ pub fn smooth_signal(
     pointwise(freq_in, freq_out, signal, bandwidth, method, n_cores)
 }
 
-pub fn apply_plan(plan: &Plan, signal: &[f64], n_cores: usize) -> Result<Vec<f64>, String> {
+pub fn apply_plan(plan: &Plan, signal: &[f64], n_cores: usize) -> Result<Vec<f64>, KernelError> {
     if signal.len() != plan.freq_in.len() {
-        return Err(format!(
+        return Err(invalid(format!(
             "signal length ({}) must match freq_in ({})",
             signal.len(),
             plan.freq_in.len()
-        ));
+        )));
     }
     let mut out = vec![0.0; plan.freq_out.len()];
     apply_into(plan, signal, &mut out, n_cores)?;
@@ -186,16 +221,16 @@ pub fn apply_many(
     n_rows: usize,
     n_cols: usize,
     n_cores: usize,
-) -> Result<Vec<f64>, String> {
+) -> Result<Vec<f64>, KernelError> {
     if n_cols != plan.freq_in.len() {
-        return Err(format!(
+        return Err(invalid(format!(
             "signals has {} columns but freq_in has length {}",
             n_cols,
             plan.freq_in.len()
-        ));
+        )));
     }
     if signals.len() != n_rows * n_cols {
-        return Err("signals length does not match its shape".to_string());
+        return Err(invalid("signals length does not match its shape"));
     }
     let n_out = plan.freq_out.len();
     let mut flat = vec![0.0; n_rows * n_out];
@@ -227,7 +262,12 @@ pub fn apply_many(
     Ok(flat)
 }
 
-fn apply_into(plan: &Plan, signal: &[f64], out: &mut [f64], n_cores: usize) -> Result<(), String> {
+fn apply_into(
+    plan: &Plan,
+    signal: &[f64],
+    out: &mut [f64],
+    n_cores: usize,
+) -> Result<(), KernelError> {
     match &plan.kind {
         Kind::Convolution { kernel } => {
             let values = kernel.as_f64();
@@ -272,7 +312,7 @@ fn pointwise(
     bandwidth: f64,
     method: Method,
     n_cores: usize,
-) -> Result<Vec<f64>, String> {
+) -> Result<Vec<f64>, KernelError> {
     let log_in: Vec<f64> = freq_in.iter().map(|f| f.log10()).collect();
     let mut out = vec![0.0; freq_out.len()];
     let failure = Mutex::new(None);
@@ -317,7 +357,13 @@ struct SampleWindow<'a> {
     approx: bool,
 }
 
-fn normalized_sum(window: &SampleWindow<'_>) -> Result<f64, String> {
+fn zero_window_error(fc: f64) -> KernelError {
+    invalid(format!(
+        "the Konno-Ohmachi window at output frequency {fc} summed to zero"
+    ))
+}
+
+fn normalized_sum(window: &SampleWindow<'_>) -> Result<f64, KernelError> {
     let mut total = 0.0;
     let mut weight_sum = 0.0;
     for j in window.lo..window.hi {
@@ -335,8 +381,20 @@ fn normalized_sum(window: &SampleWindow<'_>) -> Result<f64, String> {
     if weight_sum > 0.0 {
         Ok(total / weight_sum)
     } else {
-        Err("Konno-Ohmachi window summed to zero".to_string())
+        Err(zero_window_error(window.fc))
     }
+}
+
+/// Number of stored weights for `freq_out` against `freq_in`, before any of
+/// them is allocated. `method="exact"` stores `n_in * n_out` of them.
+fn count_weights(log_in: &[f64], freq_out: &[f64], bandwidth: f64, method: Method) -> u64 {
+    freq_out
+        .iter()
+        .map(|&fc| {
+            let (lo, hi, _) = row_window(log_in, fc.log10(), bandwidth, method);
+            (hi - lo) as u64
+        })
+        .sum()
 }
 
 fn build_sparse(
@@ -345,60 +403,100 @@ fn build_sparse(
     bandwidth: f64,
     method: Method,
     dtype: DType,
-) -> Result<Kind, String> {
+) -> Result<Kind, KernelError> {
     let log_in: Vec<f64> = freq_in.iter().map(|f| f.log10()).collect();
+    let total = count_weights(&log_in, freq_out, bandwidth, method);
+    if total > u64::from(u32::MAX) {
+        return Err(invalid(format!(
+            "the weights for {} input and {} output frequencies would hold {total} values, \
+             more than the {} this class can index; use smooth(method=\"exact\"), which \
+             stores no weights, or pass fewer output frequencies",
+            freq_in.len(),
+            freq_out.len(),
+            u32::MAX
+        )));
+    }
+    let total = total as usize;
+    let mut values = Values::with_capacity(total, dtype).map_err(|bytes| {
+        KernelError::Memory(format!(
+            "could not allocate {bytes} bytes for the {total} Konno-Ohmachi weights of {} \
+             input and {} output frequencies; use smooth(method=\"exact\"), which stores \
+             no weights, pass fewer output frequencies, or use dtype=\"float32\"",
+            freq_in.len(),
+            freq_out.len()
+        ))
+    })?;
     let mut col0 = Vec::with_capacity(freq_out.len());
     let mut start = Vec::with_capacity(freq_out.len() + 1);
-    let mut raw: Vec<f64> = Vec::new();
+    let mut row: Vec<f64> = Vec::new();
     start.push(0);
     for &fc in freq_out {
         let log_fc = fc.log10();
         let (lo, hi, approx) = row_window(&log_in, log_fc, bandwidth, method);
-        let row_at = raw.len();
+        row.clear();
         let mut weight_sum = 0.0;
         for j in lo..hi {
             let weight = weight_at(freq_in[j], log_in[j], fc, log_fc, bandwidth, approx);
-            raw.push(weight);
+            row.push(weight);
             weight_sum += weight;
         }
-        if weight_sum == 0.0 {
-            return Err("Konno-Ohmachi window summed to zero".to_string());
+        if weight_sum.is_nan() || weight_sum <= 0.0 {
+            return Err(zero_window_error(fc));
         }
-        let scale = 1.0 / weight_sum;
-        for weight in &mut raw[row_at..] {
-            *weight *= scale;
-        }
-        col0.push(u32::try_from(lo).map_err(|_| "frequency grid is too long".to_string())?);
-        let end = u32::try_from(raw.len())
-            .map_err(|_| "precomputed weights are too large".to_string())?;
-        start.push(end);
+        values.extend_scaled(&row, 1.0 / weight_sum);
+        col0.push(u32::try_from(lo).map_err(|_| invalid("frequency grid is too long"))?);
+        // `values.len() <= total <= u32::MAX` by the check above.
+        start.push(values.len() as u32);
     }
     Ok(Kind::Sparse {
         col0,
         start,
-        values: store_values(&raw, dtype)?,
+        values,
     })
 }
 
-fn store_values(raw: &[f64], dtype: DType) -> Result<Values, String> {
+/// Store a short kernel in the requested precision. Kernel weights lie in
+/// `[0, 1]`, so narrowing to float32 cannot overflow.
+fn store_values(raw: Vec<f64>, dtype: DType) -> Values {
     match dtype {
-        DType::F64 => Ok(Values::F64(raw.to_vec())),
-        DType::F32 => Ok(Values::F32(
-            raw.iter()
-                .map(|value| {
-                    let narrow = *value as f32;
-                    if value.is_finite() && !narrow.is_finite() {
-                        Err("weight does not fit in float32".to_string())
-                    } else {
-                        Ok(narrow)
-                    }
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        )),
+        DType::F64 => Values::F64(raw),
+        DType::F32 => Values::F32(raw.into_iter().map(|value| value as f32).collect()),
     }
 }
 
 impl Values {
+    /// Reserve room for `total` weights, or report the byte count that failed.
+    fn with_capacity(total: usize, dtype: DType) -> Result<Self, usize> {
+        let bytes = total.saturating_mul(dtype.bytes());
+        match dtype {
+            DType::F64 => {
+                let mut values = Vec::new();
+                values.try_reserve_exact(total).map_err(|_| bytes)?;
+                Ok(Values::F64(values))
+            }
+            DType::F32 => {
+                let mut values = Vec::new();
+                values.try_reserve_exact(total).map_err(|_| bytes)?;
+                Ok(Values::F32(values))
+            }
+        }
+    }
+
+    /// Append `row * scale` in the stored precision.
+    fn extend_scaled(&mut self, row: &[f64], scale: f64) {
+        match self {
+            Values::F64(values) => values.extend(row.iter().map(|weight| weight * scale)),
+            Values::F32(values) => values.extend(row.iter().map(|weight| (weight * scale) as f32)),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            Values::F64(values) => values.len(),
+            Values::F32(values) => values.len(),
+        }
+    }
+
     fn as_f64(&self) -> Cow<'_, [f64]> {
         match self {
             Values::F64(values) => Cow::Borrowed(values),
@@ -493,7 +591,7 @@ fn log_spacing(freq: &[f64]) -> Option<f64> {
 /// Only lags up to `n_in - 1` can pair two of `n_in` samples, so `half` is
 /// capped there. That keeps a tiny `bandwidth * du` from asking for an
 /// unbounded kernel.
-fn approx_kernel(bandwidth: f64, du: f64, n_in: usize) -> Result<Vec<f64>, String> {
+fn approx_kernel(bandwidth: f64, du: f64, n_in: usize) -> Result<Vec<f64>, KernelError> {
     let max_half = n_in.saturating_sub(1);
     let step = bandwidth * du;
     let half = if step == 0.0 {
@@ -511,11 +609,11 @@ fn approx_kernel(bandwidth: f64, du: f64, n_in: usize) -> Result<Vec<f64>, Strin
     let len = half
         .checked_mul(2)
         .and_then(|taps| taps.checked_add(1))
-        .ok_or_else(|| "convolution kernel is too long".to_string())?;
+        .ok_or_else(|| invalid("convolution kernel is too long"))?;
     let mut kernel = Vec::new();
-    kernel
-        .try_reserve_exact(len)
-        .map_err(|_| format!("could not allocate a {len}-tap convolution kernel"))?;
+    kernel.try_reserve_exact(len).map_err(|_| {
+        KernelError::Memory(format!("could not allocate a {len}-tap convolution kernel"))
+    })?;
     for index in 0..len {
         if index == half {
             kernel.push(1.0);
@@ -536,7 +634,7 @@ fn convolve_into(
     kernel: &[f64],
     out: &mut [f64],
     n_cores: usize,
-) -> Result<(), String> {
+) -> Result<(), KernelError> {
     let n = signal.len();
     let half = kernel.len() / 2;
     let failure = Mutex::new(None);
@@ -556,8 +654,9 @@ fn convolve_into(
                 weight_sum += weight;
             }
             if weight_sum == 0.0 {
-                *failure.lock().expect("window error lock") =
-                    Some("Konno-Ohmachi window summed to zero".to_string());
+                *failure.lock().expect("window error lock") = Some(invalid(
+                    "the Konno-Ohmachi convolution kernel summed to zero",
+                ));
                 continue;
             }
             *dest = total / weight_sum;
@@ -776,6 +875,64 @@ mod tests {
     }
 
     #[test]
+    fn exact_weights_are_counted_before_they_are_allocated() {
+        let freq_in: Vec<f64> = (1..=5).map(|i| i as f64).collect();
+        let freq_out = vec![1.5, 2.5, 4.0];
+        let log_in: Vec<f64> = freq_in.iter().map(|f| f.log10()).collect();
+        assert_eq!(count_weights(&log_in, &freq_out, 40.0, Method::Exact), 15);
+        let approx = count_weights(&log_in, &freq_out, 40.0, Method::Approx);
+        assert!(approx < 15, "{approx}");
+        let plan = build_plan(freq_in, freq_out, 40.0, Method::Approx, DType::F64).unwrap();
+        match plan.kind {
+            Kind::Sparse { values, start, .. } => {
+                assert_eq!(values.len() as u64, approx);
+                assert_eq!(*start.last().unwrap() as u64, approx);
+            }
+            Kind::Convolution { .. } => panic!("expected sparse weights"),
+        }
+    }
+
+    #[test]
+    fn rejects_weight_matrix_above_u32() {
+        // 70000 * 70000 = 4.9e9 weights, more than u32::MAX, so this must fail
+        // before any of them is allocated.
+        let freq: Vec<f64> = (0..70_000).map(|i| 1.0 + i as f64 * 1e-5).collect();
+        let err = build_plan(freq.clone(), freq, 40.0, Method::Exact, DType::F64).unwrap_err();
+        assert!(matches!(err, KernelError::Invalid(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("smooth(method=\"exact\")"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn float32_weights_are_the_narrowed_float64_weights() {
+        let freq: Vec<f64> = (1..40).map(|i| i as f64 * 0.3).collect();
+        let wide =
+            build_plan(freq.clone(), freq.clone(), 20.0, Method::Approx, DType::F64).unwrap();
+        let narrow = build_plan(freq.clone(), freq, 20.0, Method::Approx, DType::F32).unwrap();
+        assert_eq!(narrow.dtype, DType::F32);
+        match (&wide.kind, &narrow.kind) {
+            (
+                Kind::Sparse {
+                    values: Values::F64(wide),
+                    ..
+                },
+                Kind::Sparse {
+                    values: Values::F32(narrow),
+                    ..
+                },
+            ) => {
+                assert_eq!(wide.len(), narrow.len());
+                for (&w, &n) in wide.iter().zip(narrow) {
+                    assert_eq!(w as f32, n);
+                }
+            }
+            _ => panic!("expected sparse weights"),
+        }
+    }
+
+    #[test]
     fn rejects_more_cores_than_the_machine_has() {
         let available = std::thread::available_parallelism()
             .map(|count| count.get())
@@ -783,13 +940,16 @@ mod tests {
         assert_eq!(resolve_cores(None).unwrap(), available);
         assert_eq!(resolve_cores(Some(1)).unwrap(), 1);
         let err = resolve_cores(Some(available as isize + 1)).unwrap_err();
-        assert!(err.contains("n_cores"), "{err}");
-        assert!(resolve_cores(Some(0)).unwrap_err().contains("n_cores"));
+        assert!(err.to_string().contains("n_cores"), "{err:?}");
+        assert!(resolve_cores(Some(0))
+            .unwrap_err()
+            .to_string()
+            .contains("n_cores"));
     }
 
     #[test]
     fn rejects_non_positive_frequency() {
         let err = validate_freq(&[0.1, 0.0, 0.3], "freq_in").unwrap_err();
-        assert!(err.contains("positive"));
+        assert!(err.to_string().contains("positive"));
     }
 }
