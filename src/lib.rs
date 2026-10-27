@@ -6,7 +6,7 @@ use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyMemoryError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::{PyAny, PyDict};
+use pyo3::types::{PyAny, PyDict, PyType};
 
 use crate::kernel::{
     apply_many, apply_plan, build_plan, parse_dtype, parse_method, resolve_cores, smooth_signal,
@@ -15,8 +15,15 @@ use crate::kernel::{
 
 mod kernel;
 
-/// ``(args, kwargs)`` for ``__getnewargs_ex__``.
-type NewArgs<'py> = ((Bound<'py, PyArray1<f64>>, f64), Bound<'py, PyDict>);
+/// ``(copyreg.__newobj_ex__, (cls, args, kwargs))`` for ``__reduce__``.
+type Reduce<'py> = (
+    Bound<'py, PyAny>,
+    (
+        Bound<'py, PyType>,
+        (Bound<'py, PyArray1<f64>>, f64),
+        Bound<'py, PyDict>,
+    ),
+);
 
 fn value_error(message: impl ToString) -> PyErr {
     PyValueError::new_err(message.to_string())
@@ -157,9 +164,7 @@ fn dtype_name(py: Python<'_>, dtype: Option<&Bound<'_, PyAny>>) -> PyResult<Stri
     let Some(dtype) = dtype else {
         return Ok("float64".to_string());
     };
-    if let Ok(name) = dtype.extract::<String>() {
-        return Ok(name);
-    }
+    // Strings go through NumPy too, so "f4", "single" and np.float32 agree.
     let numpy = py.import("numpy")?;
     let dtype = numpy
         .call_method1("dtype", (dtype,))
@@ -243,7 +248,7 @@ impl PrecomputedWeights {
 
     fn __repr__(&self) -> String {
         format!(
-            "PrecomputedWeights(n_in={}, n_out={}, bandwidth={}, method='{}', dtype='{}')",
+            "PrecomputedWeights(n_in={}, n_out={}, bandwidth={:?}, method='{}', dtype='{}')",
             self.plan.freq_in.len(),
             self.plan.freq_out.len(),
             self.plan.bandwidth,
@@ -252,13 +257,20 @@ impl PrecomputedWeights {
         )
     }
 
-    /// Constructor arguments that rebuild this object, for ``pickle`` and ``copy``.
-    fn __getnewargs_ex__<'py>(&self, py: Python<'py>) -> PyResult<NewArgs<'py>> {
+    /// ``pickle`` and ``copy`` rebuild the weights from the constructor
+    /// arguments. ``copyreg.__newobj_ex__`` calls ``cls.__new__(cls, *args,
+    /// **kwargs)`` and, unlike ``__getnewargs_ex__``, works for every pickle
+    /// protocol, 0 and 1 included.
+    fn __reduce__<'py>(slf: &Bound<'py, Self>) -> PyResult<Reduce<'py>> {
+        let py = slf.py();
+        let this = slf.borrow();
         let kwargs = PyDict::new(py);
-        kwargs.set_item("freq_out", self.freq_out(py))?;
-        kwargs.set_item("method", self.method())?;
-        kwargs.set_item("dtype", self.dtype())?;
-        Ok(((self.freq_in(py), self.plan.bandwidth), kwargs))
+        kwargs.set_item("freq_out", this.freq_out(py))?;
+        kwargs.set_item("method", this.method())?;
+        kwargs.set_item("dtype", this.dtype())?;
+        let rebuild = py.import("copyreg")?.getattr("__newobj_ex__")?;
+        let args = (this.freq_in(py), this.plan.bandwidth);
+        Ok((rebuild, (slf.get_type(), args, kwargs)))
     }
 
     /// Apply the stored weights to one spectrum.

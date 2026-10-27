@@ -25,8 +25,8 @@ NATIVE_THRESHOLDS = [
     (10, 0.01),
 ]
 
-# The same gap on every 2nd, 5th and 10th sample of that record stays below
-# 2e-3 for bandwidths 20 to 80 and below 4.5e-3 at 10.
+# The same gap on every 2nd, 5th and 10th sample of that record is at most
+# 2.1e-3 for bandwidths 20 to 80 and 4.3e-3 at 10.
 DOWNSAMPLED_THRESHOLDS = [
     (80, 0.005),
     (40, 0.005),
@@ -476,6 +476,8 @@ def test_precomputed_weights_report_their_parameters():
     assert ko.PrecomputedWeights(freq).dtype == "float64"
     text = repr(weights)
     assert text.startswith("PrecomputedWeights(")
+    assert "bandwidth=40.0," in repr(ko.PrecomputedWeights(freq))
+    assert "bandwidth=1e-20," in repr(ko.PrecomputedWeights(freq, bandwidth=1e-20))
     assert "bandwidth=25.5" in text and "method='approx'" in text and "dtype='float32'" in text
 
 
@@ -494,7 +496,7 @@ def test_precomputed_weights_survive_pickle_and_copy(dtype, grid):
     clones = [pickle.loads(pickle.dumps(weights)), copy.deepcopy(weights), copy.copy(weights)]
     clones += [
         pickle.loads(pickle.dumps(weights, protocol))
-        for protocol in range(2, pickle.HIGHEST_PROTOCOL + 1)
+        for protocol in range(pickle.HIGHEST_PROTOCOL + 1)
     ]
     for clone in clones:
         assert isinstance(clone, ko.PrecomputedWeights)
@@ -508,7 +510,10 @@ def test_dtype_accepts_numpy_dtypes():
     assert ko.PrecomputedWeights(freq, dtype=np.float32).dtype == "float32"
     assert ko.PrecomputedWeights(freq, dtype=np.dtype("float64")).dtype == "float64"
     assert ko.PrecomputedWeights(freq, dtype=float).dtype == "float64"
-    for bad in (np.float16, "int32", 5):
+    for spelling, name in [("f4", "float32"), ("single", "float32"), ("<f8", "float64"),
+                           ("double", "float64"), ("float", "float64")]:
+        assert ko.PrecomputedWeights(freq, dtype=spelling).dtype == name
+    for bad in (np.float16, "int32", "float16", "not-a-dtype", 5):
         with pytest.raises(ValueError):
             ko.PrecomputedWeights(freq, dtype=bad)
 
