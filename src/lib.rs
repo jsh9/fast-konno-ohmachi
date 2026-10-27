@@ -4,13 +4,13 @@ use std::sync::Arc;
 
 use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray1, PyArray2, PyArrayMethods, PyUntypedArrayMethods};
-use pyo3::exceptions::{PyMemoryError, PyValueError};
+use pyo3::exceptions::{PyMemoryError, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyAny, PyDict, PyType};
 
 use crate::kernel::{
-    apply_many, apply_plan, build_plan, parse_dtype, parse_method, resolve_cores, smooth_signal,
-    KernelError, Plan,
+    apply_many, apply_plan, bad_core_count, build_plan, parse_dtype, parse_method, resolve_cores,
+    smooth_signal, KernelError, Plan,
 };
 
 mod kernel;
@@ -34,6 +34,22 @@ fn kernel_error(err: KernelError) -> PyErr {
     match err {
         KernelError::Invalid(message) => PyValueError::new_err(message),
         KernelError::Memory(message) => PyMemoryError::new_err(message),
+    }
+}
+
+/// Extracts ``n_cores``. An integer too large for ``isize`` is out of range like
+/// any other count above the CPU limit, so it raises ``ValueError`` rather than
+/// the ``OverflowError`` a plain ``isize`` argument would.
+fn n_cores_arg(obj: &Bound<'_, PyAny>) -> PyResult<Option<isize>> {
+    if obj.is_none() {
+        return Ok(None);
+    }
+    match obj.extract::<isize>() {
+        Ok(n) => Ok(Some(n)),
+        Err(err) if err.is_instance_of::<PyOverflowError>(obj.py()) => {
+            Err(kernel_error(bad_core_count(obj, obj.gt(0)?)))
+        }
+        Err(err) => Err(err),
     }
 }
 
@@ -130,7 +146,8 @@ fn matrix_out(
 ///     Default is ``"approx"``.
 /// n_cores : int or None, optional
 ///     How many cores to use. ``None`` uses every logical CPU available to
-///     the process. A value above that count is an error. Default is 1.
+///     the process. A value below 1 or above that count raises
+///     ``ValueError``. Default is 1.
 #[pyfunction]
 #[pyo3(signature = (signal, freq_in, bandwidth=40.0, *, freq_out=None, method="approx", n_cores=1))]
 fn smooth<'py>(
@@ -140,7 +157,7 @@ fn smooth<'py>(
     bandwidth: f64,
     freq_out: Option<&Bound<'py, PyAny>>,
     method: &str,
-    n_cores: Option<isize>,
+    #[pyo3(from_py_with = n_cores_arg)] n_cores: Option<isize>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
     let signal = f64_array_1d(py, signal)?;
     let signal = signal.readonly();
@@ -279,7 +296,7 @@ impl PrecomputedWeights {
         &self,
         py: Python<'py>,
         signal: &Bound<'py, PyAny>,
-        n_cores: Option<isize>,
+        #[pyo3(from_py_with = n_cores_arg)] n_cores: Option<isize>,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
         let signal = f64_array_1d(py, signal)?;
         let signal = signal.readonly();
@@ -295,14 +312,14 @@ impl PrecomputedWeights {
     /// Apply the stored weights to a batch of spectra.
     ///
     /// ``signals`` has shape ``(n_records, n_freq)``. ``n_cores`` defaults to
-    /// every logical CPU available to the process. A value above that count
-    /// is an error.
+    /// every logical CPU available to the process. A value below 1 or above
+    /// that count raises ``ValueError``.
     #[pyo3(signature = (signals, n_cores=None))]
     fn apply_many<'py>(
         &self,
         py: Python<'py>,
         signals: &Bound<'py, PyAny>,
-        n_cores: Option<isize>,
+        #[pyo3(from_py_with = n_cores_arg)] n_cores: Option<isize>,
     ) -> PyResult<Bound<'py, PyArray2<f64>>> {
         let signals = f64_array_2d(py, signals)?;
         let signals = signals.readonly();

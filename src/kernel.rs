@@ -112,17 +112,33 @@ pub fn parse_dtype(dtype: &str) -> Result<DType, KernelError> {
     }
 }
 
-pub fn resolve_cores(n_cores: Option<isize>) -> Result<usize, KernelError> {
-    let available = std::thread::available_parallelism()
+/// Logical CPUs this process may use. CPU quotas and affinity masks count, so
+/// this can be fewer than the machine has.
+pub fn available_cores() -> usize {
+    std::thread::available_parallelism()
         .map(|count| count.get())
-        .unwrap_or(1);
+        .unwrap_or(1)
+}
+
+/// The error for an `n_cores` outside `1..=available_cores()`, quoting the value
+/// as given. `positive` says which side of the range it fell off.
+pub fn bad_core_count(n_cores: impl std::fmt::Display, positive: bool) -> KernelError {
+    if positive {
+        invalid(format!(
+            "n_cores ({n_cores}) exceeds the {} logical CPUs available to this process",
+            available_cores()
+        ))
+    } else {
+        invalid(format!("n_cores must be >= 1 or None, got {n_cores}"))
+    }
+}
+
+pub fn resolve_cores(n_cores: Option<isize>) -> Result<usize, KernelError> {
+    let available = available_cores();
     match n_cores {
         None => Ok(available),
         Some(n) if n >= 1 && (n as usize) <= available => Ok(n as usize),
-        Some(n) if n < 1 => Err(invalid(format!("n_cores must be >= 1 or None, got {n}"))),
-        Some(n) => Err(invalid(format!(
-            "n_cores ({n}) exceeds the {available} logical CPUs available to this process"
-        ))),
+        Some(n) => Err(bad_core_count(n, n >= 1)),
     }
 }
 
@@ -1068,6 +1084,16 @@ mod tests {
         assert_eq!(resolve_cores(Some(1)).unwrap(), 1);
         let err = resolve_cores(Some(available as isize + 1)).unwrap_err();
         assert!(err.to_string().contains("n_cores"), "{err:?}");
+        assert!(err
+            .to_string()
+            .contains(&format!("the {available} logical CPUs")));
+        let huge = bad_core_count("1180591620717411303424", true).to_string();
+        assert!(
+            huge.starts_with("n_cores (1180591620717411303424) exceeds"),
+            "{huge}"
+        );
+        let tiny = bad_core_count("-5", false).to_string();
+        assert_eq!(tiny, "n_cores must be >= 1 or None, got -5");
         assert!(resolve_cores(Some(0))
             .unwrap_err()
             .to_string()

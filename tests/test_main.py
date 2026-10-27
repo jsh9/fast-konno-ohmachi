@@ -554,18 +554,34 @@ def test_bad_bandwidth_raises(bandwidth):
         ko.smooth(signal, freq, bandwidth=bandwidth)
 
 
-def test_n_cores_above_the_machine_raises():
+def _n_cores_calls():
     freq = np.arange(1, 8, dtype=np.float64)
     signal = np.ones_like(freq)
     weights = ko.PrecomputedWeights(freq, bandwidth=40)
     rows = np.vstack([signal, signal])
-    for call in (
+    return (
         lambda n_cores: ko.smooth(signal, freq, n_cores=n_cores),
         lambda n_cores: weights.apply(signal, n_cores=n_cores),
         lambda n_cores: weights.apply_many(rows, n_cores=n_cores),
-    ):
-        with pytest.raises(ValueError, match="n_cores"):
-            call(10**6)
+    )
+
+
+# Integers beyond 64 bits are out of range like any other count, so they raise
+# ValueError as well, not OverflowError.
+@pytest.mark.parametrize("n_cores", [0, -1, 10**6, np.int64(10**6), 2**70, -(2**70), 2**200])
+def test_out_of_range_n_cores_raise_value_error(n_cores):
+    for call in _n_cores_calls():
+        with pytest.raises(ValueError, match="n_cores") as raised:
+            call(n_cores)
+        assert not isinstance(raised.value, OverflowError)
+        assert str(n_cores) in str(raised.value)
+
+
+@pytest.mark.parametrize("n_cores", [2.5, "2", [2]])
+def test_non_integer_n_cores_raise_type_error(n_cores):
+    for call in _n_cores_calls():
+        with pytest.raises(TypeError):
+            call(n_cores)
 
 
 def test_exact_weights_too_large_raise_before_allocating():
