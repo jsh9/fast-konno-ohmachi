@@ -252,15 +252,26 @@ pub fn apply_many(
         return Err(invalid("signals length does not match its shape"));
     }
     let n_out = plan.freq_out.len();
-    let mut flat = vec![0.0; n_rows * n_out];
+    let mut flat = zeroed_output(n_rows, n_out)?;
     if n_rows == 0 {
         return Ok(flat);
     }
     // Rows cost the same, so they split evenly across workers. Cores left
     // over when there are fewer rows than cores split each row instead.
     let workers = n_cores.max(1).min(n_rows);
-    let rows_per = n_rows.div_ceil(workers);
     let inner = (n_cores / workers).max(1);
+    if workers == 1 {
+        for (row, dest) in flat.chunks_mut(n_out).enumerate() {
+            apply_into(
+                plan,
+                &signals[row * n_cols..(row + 1) * n_cols],
+                dest,
+                inner,
+            )?;
+        }
+        return Ok(flat);
+    }
+    let rows_per = n_rows.div_ceil(workers);
     let failure = Mutex::new(None);
     std::thread::scope(|scope| {
         for (group, part) in flat.chunks_mut(rows_per * n_out).enumerate() {
@@ -281,6 +292,26 @@ pub fn apply_many(
     if let Some(err) = failure.into_inner().expect("window error lock") {
         return Err(err);
     }
+    Ok(flat)
+}
+
+/// A zeroed `n_rows * n_out` result, or `MemoryError` instead of an abort when
+/// it does not fit. `n_out` does not depend on the input width, so this can be
+/// far larger than anything the caller passed in.
+fn zeroed_output(n_rows: usize, n_out: usize) -> Result<Vec<f64>, KernelError> {
+    let too_large = |bytes: String| {
+        KernelError::Memory(format!(
+            "could not allocate {bytes} bytes for a result of {n_rows} rows and {n_out} output \
+             frequencies; pass fewer rows per call or fewer output frequencies"
+        ))
+    };
+    let len = n_rows
+        .checked_mul(n_out)
+        .ok_or_else(|| too_large("more than usize::MAX".to_string()))?;
+    let mut flat = Vec::new();
+    flat.try_reserve_exact(len)
+        .map_err(|_| too_large(len.saturating_mul(std::mem::size_of::<f64>()).to_string()))?;
+    flat.resize(len, 0.0);
     Ok(flat)
 }
 
@@ -416,7 +447,8 @@ fn count_weights(log_in: &[f64], freq_out: &[f64], bandwidth: f64, method: Metho
             let (lo, hi, _) = row_window(log_in, fc.log10(), bandwidth, method);
             (hi - lo) as u64
         })
-        .sum()
+        // Saturate rather than wrap: anything above u32::MAX is rejected anyway.
+        .fold(0u64, u64::saturating_add)
 }
 
 fn build_sparse(
@@ -698,13 +730,16 @@ fn convolve_into(
 fn for_each_chunk(n_cores: usize, out: &mut [f64], f: &(impl Fn(&mut [f64], usize) + Sync)) {
     let n = out.len();
     let workers = n_cores.max(1).min(n.max(1));
-    if workers <= 1 || n == 0 {
-        f(out, 0);
-        return;
-    }
     // About 32 blocks per worker, and at least 64 outputs per block so the
     // lock around the block iterator stays negligible.
     let block = (n / (workers * 32)).clamp(64, 4096);
+    // A short output has fewer blocks than workers; a thread per block is
+    // enough, and one block runs on the calling thread.
+    let workers = workers.min(n.div_ceil(block));
+    if workers <= 1 {
+        f(out, 0);
+        return;
+    }
     let blocks = Mutex::new(out.chunks_mut(block).enumerate());
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -996,6 +1031,32 @@ mod tests {
             assert_eq!(&batch[..n], &serial[..]);
             assert_eq!(&batch[n..], &apply_plan(&plan, &two[n..], 1).unwrap()[..]);
         }
+    }
+
+    #[test]
+    fn oversized_results_are_memory_errors() {
+        assert!(matches!(
+            zeroed_output(usize::MAX, 2),
+            Err(KernelError::Memory(_))
+        ));
+        // 2^60 values is more than any allocator will hand out.
+        assert!(matches!(
+            zeroed_output(1 << 40, 1 << 20),
+            Err(KernelError::Memory(_))
+        ));
+        assert_eq!(zeroed_output(0, 7).unwrap(), Vec::<f64>::new());
+        assert_eq!(zeroed_output(2, 3).unwrap(), vec![0.0; 6]);
+    }
+
+    #[test]
+    fn weight_count_saturates_instead_of_wrapping() {
+        let log_in = vec![0.0; 4];
+        let freq_out = vec![1.0; 3];
+        assert_eq!(count_weights(&log_in, &freq_out, 40.0, Method::Exact), 12);
+        assert_eq!(
+            [u64::MAX, 5].into_iter().fold(0u64, u64::saturating_add),
+            u64::MAX
+        );
     }
 
     #[test]
