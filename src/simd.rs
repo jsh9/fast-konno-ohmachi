@@ -245,7 +245,9 @@ mod x86 {
             zero: || _mm_setzero_pd(),
             splat: |a: f64| _mm_set1_pd(a),
             load: |p: *const f64| _mm_loadu_pd(p),
-            load_f32: |p: *const f32| _mm_cvtps_pd(_mm_castpd_ps(_mm_load_sd(p as *const f64))),
+            // Two f32 values in the low half. `_mm_loadl_epi64` reads 8 bytes
+            // without assuming 8-byte alignment, which f32 weights may lack.
+            load_f32: |p: *const f32| _mm_cvtps_pd(_mm_castsi128_ps(_mm_loadl_epi64(p as *const __m128i))),
             add: |a, b| _mm_add_pd(a, b),
             mul: |a, b| _mm_mul_pd(a, b),
             store: |p: *mut f64, v| _mm_storeu_pd(p, v),
@@ -650,6 +652,12 @@ mod tests {
             let refs: Vec<&[f64]> = signals.iter().map(|s| s.as_slice()).collect();
             check(&w, &refs);
             check(&w32, &refs);
+            // Rows start at arbitrary offsets in the stored weights, so f32
+            // rows are often only 4-byte aligned.
+            if n > 1 {
+                check(&w[1..], &refs);
+                check(&w32[1..], &refs);
+            }
         }
     }
 }
