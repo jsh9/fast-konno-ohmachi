@@ -468,13 +468,12 @@ impl SparseRows<'_> {
             let (column, a, b) = self.row(i);
             (&stored[a..b], &signal[column..column + (b - a)])
         };
-        let four = |i: usize, group: &mut [f64]| {
+        let four = |i: usize, group: &mut [f64; 4]| {
             let rows: [(&[W], &[f64]); 4] = core::array::from_fn(|r| pair(i + r));
-            let got = simd::dot_rows4(rows.map(|(w, _)| w), rows.map(|(_, s)| s));
-            group.copy_from_slice(&got);
+            *group = simd::dot_rows4(rows.map(|(w, _)| w), rows.map(|(_, s)| s));
         };
-        let full = dest.len() - dest.len() % 4;
-        let (groups, rest) = dest.split_at_mut(full);
+        let (groups, rest) = dest.as_chunks_mut::<4>();
+        let full = 4 * groups.len();
         let tail = |dest: &mut [f64]| {
             for (k, value) in dest.iter_mut().enumerate() {
                 let (w, s) = pair(first + full + k);
@@ -483,11 +482,11 @@ impl SparseRows<'_> {
         };
         if reverse {
             tail(rest);
-            for (g, group) in groups.chunks_exact_mut(4).enumerate().rev() {
+            for (g, group) in groups.iter_mut().enumerate().rev() {
                 four(first + 4 * g, group);
             }
         } else {
-            for (g, group) in groups.chunks_exact_mut(4).enumerate() {
+            for (g, group) in groups.iter_mut().enumerate() {
                 four(first + 4 * g, group);
             }
             tail(rest);
