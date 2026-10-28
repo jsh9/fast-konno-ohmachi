@@ -71,6 +71,43 @@ On a log-uniform grid, with `method="approx"` and `freq_out` left as `freq_in`, 
 
 `demo/Demo_konno_ohmachi_smooth.py` smooths the spectrum plotted above. Running it needs `scipy` and `matplotlib`.
 
+## Benchmark against pykooh
+
+[pykooh](https://github.com/arkottke/pykooh) 0.5.1 is another Konno-Ohmachi implementation, compiled with numba. The tables below time both libraries on the 15000-point Tohoku spectrum in `demo/` (a linear grid from 0.0033 to 50 Hz) with bandwidth 40. pykooh's `simplified=True` keeps the same `10**(±3/b)` range as `method="approx"` (the "cut window" rows), `simplified=False` sums over every frequency like `method="exact"`, and its `CachedSmoother` plays the role of `PrecomputedWeights(method="exact")`. pykooh has no cached form of the cut window.
+
+Each time is the best of several runs, on a 4-vCPU x86_64 Linux VM with Python 3.13 and NumPy 2.5.4. The 1-CPU columns pin the whole process to one CPU with `taskset -c 0`, which also limits NumPy's BLAS; they are the per-core comparison. `fast-konno-ohmachi` runs with `n_cores=None` throughout.
+
+Output at the 15000 input frequencies:
+
+| Case | pykooh, 1 CPU | fast-konno-ohmachi, 1 CPU | pykooh, 4 CPUs | fast-konno-ohmachi, 4 CPUs |
+|---|---|---|---|---|
+| `smooth`, exact window | 7.08 s | 3.12 s | 7.25 s | 0.86 s |
+| `smooth`, cut window | 1.26 s | 226 ms | 1.21 s | 65 ms |
+| Exact weights: build | 35.3 s | 7.2 s | 35.2 s | 4.6 s |
+| Exact weights: apply to 1 spectrum | 136 ms | 334 ms | 46 ms | 89 ms |
+| Exact weights: apply to 64 spectra | 9.58 s | 22.2 s | 2.80 s | 5.56 s |
+| Cut weights: build | n/a | 393 ms | n/a | 400 ms |
+| Cut weights: apply to 64 spectra | n/a | 3.51 s | n/a | 882 ms |
+
+Output at 419 log-spaced frequencies, 100 per decade:
+
+| Case | pykooh, 1 CPU | fast-konno-ohmachi, 1 CPU | pykooh, 4 CPUs | fast-konno-ohmachi, 4 CPUs |
+|---|---|---|---|---|
+| `smooth`, exact window | 228 ms | 85 ms | 196 ms | 32 ms |
+| `smooth`, cut window | 14.4 ms | 9.4 ms | 13.8 ms | 4.0 ms |
+| Exact weights: build | 943 ms | 138 ms | 657 ms | 108 ms |
+| Exact weights: apply to 1 spectrum | 4.5 ms | 9.7 ms | 2.0 ms | 4.5 ms |
+| Exact weights: apply to 64 spectra | 293 ms | 608 ms | 116 ms | 159 ms |
+| Cut weights: build | n/a | 7.5 ms | n/a | 6.5 ms |
+| Cut weights: apply to 64 spectra | n/a | 39 ms | n/a | 10.6 ms |
+
+- **One-shot smoothing** is 1.5 to 6 times faster on one CPU and up to 18 times faster on four, because pykooh's numba kernel runs on one thread.
+- **Building exact weights** is 5 to 8 times faster. Builds run on one thread in both libraries. The 1.8 GB matrices make page faults a large, variable part of the build time on this VM, which is why the two `fast-konno-ohmachi` columns differ.
+- **Applying exact weights is 1.4 to 2.5 times as fast in pykooh.** `CachedSmoother` stores a dense matrix and multiplies it with NumPy's BLAS, which is vectorized. `PrecomputedWeights` with the default cut window stores 6 times fewer weights (286 MB instead of 1.8 GB on the input grid) and applies them to 64 spectra in 3.51 s on one CPU, against 9.58 s for pykooh's dense exact weights.
+- **Results agree** to within 4e-14 of the peak with the exact window and 3e-12 with the cut window. At 42 of the log-spaced outputs (43 with the cut window), all below 0.016 Hz, pykooh returns NaN because the window weights there sum to less than 0.3; `fast-konno-ohmachi` returns a value, falling back to the exact window where the cut window holds no sample.
+
+`demo/benchmark_pykooh.py` reproduces these tables; it needs `pykooh` and `scipy`.
+
 ## Version 0.2
 
 0.2 replaces the pure-Python implementation. `fast_konno_ohmachi`, `faster_konno_ohmachi`, and `slow_konno_ohmachi` are gone, along with `smooth_coeff`, `progress_bar`, and the even-integer limit on the bandwidth.
