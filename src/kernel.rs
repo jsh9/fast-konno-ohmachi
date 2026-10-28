@@ -5,7 +5,10 @@
 //! `method="exact"` sums the published window over every positive frequency.
 
 use std::borrow::Cow;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
+
+use crate::simd;
 
 /// Why a kernel call could not run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,9 +87,14 @@ pub enum Kind {
         start: Vec<u32>,
         values: Values,
     },
+    /// Exact window with `freq_out == freq_in`. The unnormalized window is
+    /// symmetric with ones on the diagonal, so only the strict upper triangle
+    /// is stored: row `i` holds the weights of inputs `i+1..n`, starting at
+    /// `symmetric_offset(n, i)`. `scale[i]` is one over row `i`'s full sum.
+    Symmetric { values: Values, scale: Vec<f64> },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Plan {
     pub freq_in: Vec<f64>,
     pub freq_out: Vec<f64>,
@@ -94,6 +102,11 @@ pub struct Plan {
     pub method: Method,
     pub dtype: DType,
     pub kind: Kind,
+    /// Flips on every one-spectrum `apply` of stored weights, which then runs
+    /// through the rows in the other direction. Weights slightly larger than
+    /// the last-level cache then start each call on the rows the previous
+    /// call left cached. Rows are independent, so results do not change.
+    sweep: AtomicBool,
 }
 
 pub fn parse_method(method: &str) -> Result<Method, KernelError> {
@@ -198,6 +211,9 @@ pub fn build_plan(
         Some(du) => Kind::Convolution {
             kernel: store_values(approx_kernel(bandwidth, du, freq_in.len())?, dtype),
         },
+        None if method == Method::Exact && same_grid(&freq_in, &freq_out) => {
+            build_symmetric(&freq_in, bandwidth, dtype)?
+        }
         None => build_sparse(&freq_in, &freq_out, bandwidth, method, dtype)?,
     };
     Ok(Plan {
@@ -207,6 +223,7 @@ pub fn build_plan(
         method,
         dtype,
         kind,
+        sweep: AtomicBool::new(false),
     })
 }
 
@@ -246,7 +263,8 @@ pub fn apply_plan(plan: &Plan, signal: &[f64], n_cores: usize) -> Result<Vec<f64
         )));
     }
     let mut out = vec![0.0; plan.freq_out.len()];
-    apply_into(plan, signal, &mut out, n_cores)?;
+    let reverse = plan.sweep.fetch_xor(true, Ordering::Relaxed);
+    apply_into(plan, signal, &mut out, n_cores, reverse)?;
     Ok(out)
 }
 
@@ -272,6 +290,37 @@ pub fn apply_many(
     if n_rows == 0 {
         return Ok(flat);
     }
+    if let Kind::Sparse {
+        col0,
+        start,
+        values,
+    } = &plan.kind
+    {
+        let rows = SparseRows {
+            col0,
+            start,
+            values,
+        };
+        rows.apply_many(signals, n_cols, n_cores, &mut flat)?;
+        return Ok(flat);
+    }
+    if let Kind::Symmetric { values, scale } = &plan.kind {
+        let rows = SymmetricRows { values, scale };
+        // As many spectra per pass over the weights as keep the per-chunk
+        // accumulators near 16 MiB.
+        let per_spectrum = (n_out + rows.accumulator_len()) * std::mem::size_of::<f64>();
+        let block = ((16 << 20) / per_spectrum).clamp(1, 64);
+        for r0 in (0..n_rows).step_by(block) {
+            let r1 = (r0 + block).min(n_rows);
+            let block_signals: Vec<&[f64]> = (r0..r1)
+                .map(|r| &signals[r * n_cols..(r + 1) * n_cols])
+                .collect();
+            let mut outs: Vec<&mut [f64]> =
+                flat[r0 * n_out..r1 * n_out].chunks_mut(n_out).collect();
+            rows.apply_block(&block_signals, &mut outs, n_cores)?;
+        }
+        return Ok(flat);
+    }
     // Rows cost the same, so they split evenly across workers. Cores left
     // over when there are fewer rows than cores split each row instead.
     let workers = n_cores.max(1).min(n_rows);
@@ -283,6 +332,7 @@ pub fn apply_many(
                 &signals[row * n_cols..(row + 1) * n_cols],
                 dest,
                 inner,
+                false,
             )?;
         }
         return Ok(flat);
@@ -298,7 +348,7 @@ pub fn apply_many(
                 for row in 0..rows_here {
                     let sample = &signals[(row0 + row) * n_cols..(row0 + row + 1) * n_cols];
                     let dest = &mut part[row * n_out..(row + 1) * n_out];
-                    if let Err(err) = apply_into(plan, sample, dest, inner) {
+                    if let Err(err) = apply_into(plan, sample, dest, inner, false) {
                         *failure.lock().expect("window error lock") = Some(err);
                     }
                 }
@@ -336,6 +386,7 @@ fn apply_into(
     signal: &[f64],
     out: &mut [f64],
     n_cores: usize,
+    reverse: bool,
 ) -> Result<(), KernelError> {
     match &plan.kind {
         Kind::Convolution { kernel } => {
@@ -347,31 +398,151 @@ fn apply_into(
             start,
             values,
         } => {
-            for_each_chunk(n_cores, out, &|part, offset| {
-                for (local, dest) in part.iter_mut().enumerate() {
-                    let i = offset + local;
-                    let a = start[i] as usize;
-                    let b = start[i + 1] as usize;
-                    let column = col0[i] as usize;
-                    let mut total = 0.0;
-                    match values {
-                        Values::F64(stored) => {
-                            for (k, &weight) in stored[a..b].iter().enumerate() {
-                                total += weight * signal[column + k];
-                            }
-                        }
-                        Values::F32(stored) => {
-                            for (k, &weight) in stored[a..b].iter().enumerate() {
-                                total += f64::from(weight) * signal[column + k];
-                            }
-                        }
-                    }
-                    *dest = total;
-                }
+            let rows = SparseRows {
+                col0,
+                start,
+                values,
+            };
+            for_each_block(n_cores, out, 1, rows.grain(), reverse, &|part, first| {
+                rows.dot_range(first, signal, part, reverse);
             });
+        }
+        Kind::Symmetric { values, scale } => {
+            let rows = SymmetricRows { values, scale };
+            rows.apply_block(&[signal], &mut [out], n_cores)?;
         }
     }
     Ok(())
+}
+
+/// Spectra multiplied together per pass over the stored weights: as many as
+/// fit in about 8 MiB, so a block stays in the last-level cache while every
+/// output row is applied to it.
+fn spectra_per_block(n_cols: usize) -> usize {
+    let fit = (8 << 20) / (n_cols.max(1) * std::mem::size_of::<f64>());
+    (fit.clamp(4, 256) / 4) * 4
+}
+
+/// The stored weights of a `Kind::Sparse` plan.
+struct SparseRows<'a> {
+    col0: &'a [u32],
+    start: &'a [u32],
+    values: &'a Values,
+}
+
+impl SparseRows<'_> {
+    /// First input column, and the stored range, of output row `i`.
+    fn row(&self, i: usize) -> (usize, usize, usize) {
+        (
+            self.col0[i] as usize,
+            self.start[i] as usize,
+            self.start[i + 1] as usize,
+        )
+    }
+
+    /// Rows per scheduling block: enough that a block holds about 64K weights.
+    fn grain(&self) -> usize {
+        let rows = self.col0.len().max(1);
+        let average = (*self.start.last().unwrap_or(&0) as usize / rows).max(1);
+        (65536 / average).clamp(4, 64)
+    }
+
+    /// `dest[k] = row first+k · signal`, four rows at a time so four weight
+    /// streams are in flight; each value equals the one-row dot product.
+    fn dot_range(&self, first: usize, signal: &[f64], dest: &mut [f64], reverse: bool) {
+        match self.values {
+            Values::F64(stored) => self.dot_range_typed(stored, first, signal, dest, reverse),
+            Values::F32(stored) => self.dot_range_typed(stored, first, signal, dest, reverse),
+        }
+    }
+
+    fn dot_range_typed<W: simd::Weight>(
+        &self,
+        stored: &[W],
+        first: usize,
+        signal: &[f64],
+        dest: &mut [f64],
+        reverse: bool,
+    ) {
+        let pair = |i: usize| {
+            let (column, a, b) = self.row(i);
+            (&stored[a..b], &signal[column..column + (b - a)])
+        };
+        let four = |i: usize, group: &mut [f64]| {
+            let rows: [(&[W], &[f64]); 4] = core::array::from_fn(|r| pair(i + r));
+            let got = simd::dot_rows4(rows.map(|(w, _)| w), rows.map(|(_, s)| s));
+            group.copy_from_slice(&got);
+        };
+        let full = dest.len() - dest.len() % 4;
+        let (groups, rest) = dest.split_at_mut(full);
+        let tail = |dest: &mut [f64]| {
+            for (k, value) in dest.iter_mut().enumerate() {
+                let (w, s) = pair(first + full + k);
+                *value = simd::dot(w, s);
+            }
+        };
+        if reverse {
+            tail(rest);
+            for (g, group) in groups.chunks_exact_mut(4).enumerate().rev() {
+                four(first + 4 * g, group);
+            }
+        } else {
+            for (g, group) in groups.chunks_exact_mut(4).enumerate() {
+                four(first + 4 * g, group);
+            }
+            tail(rest);
+        }
+    }
+
+    /// `apply_many` for stored weights. Each output row is read once per block
+    /// of spectra and multiplied with all of them, instead of once per
+    /// spectrum, and every value equals what `dot` gives for that spectrum.
+    fn apply_many(
+        &self,
+        signals: &[f64],
+        n_cols: usize,
+        n_cores: usize,
+        flat: &mut [f64],
+    ) -> Result<(), KernelError> {
+        let n_out = self.col0.len();
+        let n_rows = flat.len() / n_out;
+        let block = spectra_per_block(n_cols).min(n_rows);
+        // Output-major results for one block of spectra.
+        let mut scratch = zeroed_output(n_out, block)?;
+        for r0 in (0..n_rows).step_by(block) {
+            let width = block.min(n_rows - r0);
+            let part = &mut scratch[..n_out * width];
+            for_each_block(
+                n_cores,
+                part,
+                width,
+                (64 / width).max(1),
+                false,
+                &|chunk, first| {
+                    let mut refs: Vec<&[f64]> = Vec::with_capacity(width);
+                    for (local, dest) in chunk.chunks_mut(width).enumerate() {
+                        let (column, a, b) = self.row(first + local);
+                        let len = b - a;
+                        refs.clear();
+                        refs.extend((r0..r0 + width).map(|r| {
+                            let begin = r * n_cols + column;
+                            &signals[begin..begin + len]
+                        }));
+                        match self.values {
+                            Values::F64(stored) => simd::dot_batch(&stored[a..b], &refs, dest),
+                            Values::F32(stored) => simd::dot_batch(&stored[a..b], &refs, dest),
+                        }
+                    }
+                },
+            );
+            for (i, values) in part.chunks(width).enumerate() {
+                for (r, &value) in values.iter().enumerate() {
+                    flat[(r0 + r) * n_out + i] = value;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn pointwise(
@@ -525,6 +696,56 @@ fn build_sparse(
     })
 }
 
+/// Start of row `i`'s stored weights in a symmetric plan over `n` frequencies:
+/// rows `0..i` hold `(n - 1) + (n - 2) + ... + (n - i)` weights.
+fn symmetric_offset(n: usize, i: usize) -> usize {
+    i * (2 * n - i - 1) / 2
+}
+
+fn build_symmetric(freq: &[f64], bandwidth: f64, dtype: DType) -> Result<Kind, KernelError> {
+    let n = freq.len();
+    let total = (n as u64) * (n as u64 - 1) / 2;
+    if total > u64::from(u32::MAX) {
+        return Err(invalid(format!(
+            "the exact weights for {n} frequencies would hold {total} values, more than \
+             the {} this class can store; use smooth(method=\"exact\"), which stores no \
+             weights, or pass fewer frequencies",
+            u32::MAX
+        )));
+    }
+    let total = total as usize;
+    let mut values = Values::with_capacity(total, dtype).map_err(|bytes| {
+        KernelError::Memory(format!(
+            "could not allocate {bytes} bytes for the {total} exact Konno-Ohmachi weights of \
+             {n} frequencies; use smooth(method=\"exact\"), which stores no weights, pass \
+             fewer frequencies, or use dtype=\"float32\""
+        ))
+    })?;
+    let log_f: Vec<f64> = freq.iter().map(|f| f.log10()).collect();
+    // Each row's window sum is its diagonal (1), the lower triangle that
+    // earlier rows add to `lower`, and its own upper triangle.
+    let mut lower = vec![0.0f64; n];
+    let mut scale = Vec::with_capacity(n);
+    let mut row: Vec<f64> = Vec::with_capacity(n);
+    for i in 0..n {
+        row.clear();
+        let mut upper = 0.0;
+        for j in i + 1..n {
+            let weight = weight_at(freq[j], log_f[j], freq[i], log_f[i], bandwidth, false);
+            row.push(weight);
+            upper += weight;
+            lower[j] += weight;
+        }
+        let sum = 1.0 + lower[i] + upper;
+        if sum.is_nan() || sum <= 0.0 {
+            return Err(zero_window_error(freq[i]));
+        }
+        scale.push(1.0 / sum);
+        values.extend_scaled(&row, 1.0);
+    }
+    Ok(Kind::Symmetric { values, scale })
+}
+
 /// Store a short kernel in the requested precision. Kernel weights lie in
 /// `[0, 1]`, so narrowing to float32 cannot overflow.
 fn store_values(raw: Vec<f64>, dtype: DType) -> Values {
@@ -532,6 +753,38 @@ fn store_values(raw: Vec<f64>, dtype: DType) -> Values {
         DType::F64 => Values::F64(raw),
         DType::F32 => Values::F32(raw.into_iter().map(|value| value as f32).collect()),
     }
+}
+
+/// Ask Linux to back a large weight buffer with transparent huge pages, as
+/// NumPy does for its arrays: streaming through the weights then takes far
+/// fewer TLB misses, and filling them far fewer page faults. The advice never
+/// changes the contents. Elsewhere this does nothing.
+fn advise_huge_pages<T>(buffer: &Vec<T>) {
+    #[cfg(target_os = "linux")]
+    {
+        const HUGE: usize = 2 << 20;
+        let bytes = buffer.capacity() * std::mem::size_of::<T>();
+        if bytes < 2 * HUGE {
+            return;
+        }
+        let start = buffer.as_ptr() as usize;
+        let first = (start + HUGE - 1) & !(HUGE - 1);
+        let last = (start + bytes) & !(HUGE - 1);
+        if last > first {
+            // SAFETY: the range lies inside the buffer's own allocation, and
+            // MADV_HUGEPAGE only changes how the kernel backs those pages.
+            // The return value is ignored: the advice is optional.
+            unsafe {
+                libc::madvise(
+                    first as *mut libc::c_void,
+                    last - first,
+                    libc::MADV_HUGEPAGE,
+                );
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = buffer;
 }
 
 impl Values {
@@ -542,11 +795,13 @@ impl Values {
             DType::F64 => {
                 let mut values = Vec::new();
                 values.try_reserve_exact(total).map_err(|_| bytes)?;
+                advise_huge_pages(&values);
                 Ok(Values::F64(values))
             }
             DType::F32 => {
                 let mut values = Vec::new();
                 values.try_reserve_exact(total).map_err(|_| bytes)?;
+                advise_huge_pages(&values);
                 Ok(Values::F32(values))
             }
         }
@@ -738,25 +993,223 @@ fn convolve_into(
     Ok(())
 }
 
-/// Run `f(part, offset)` over disjoint blocks of `out` on up to `n_cores`
-/// workers. Blocks are handed out as workers free up, so uneven work (the
-/// approx window widens with frequency on a linear grid) still balances.
-/// Each output index is computed by exactly one worker, in a fixed order, so
-/// the result does not depend on the worker count.
+/// Row chunks of a symmetric plan over `n` frequencies, fixed by `n` alone so
+/// results do not depend on the worker count: chunk `c` covers rows
+/// `bounds[c]..bounds[c + 1]`, holding about the same number of weights.
+fn symmetric_bounds(n: usize) -> Vec<usize> {
+    const CHUNKS: u64 = 32;
+    // Row `i` costs its `n - 1 - i` stored weights plus its diagonal.
+    let total = (n as u64) * (n as u64 + 1) / 2;
+    let mut bounds = vec![0usize];
+    let mut done = 0u64;
+    for i in 0..n {
+        done += (n - i) as u64;
+        let next = bounds.len() as u64;
+        if i + 1 < n && next < CHUNKS && done * CHUNKS >= next * total {
+            bounds.push(i + 1);
+        }
+    }
+    bounds.push(n);
+    bounds
+}
+
+/// Split `rest` into consecutive pieces of the given lengths.
+fn split_lengths(mut rest: &mut [f64], lengths: impl Iterator<Item = usize>) -> Vec<&mut [f64]> {
+    let mut pieces = Vec::new();
+    for len in lengths {
+        let (head, tail) = std::mem::take(&mut rest).split_at_mut(len);
+        pieces.push(head);
+        rest = tail;
+    }
+    pieces
+}
+
+/// The stored weights of a `Kind::Symmetric` plan.
+struct SymmetricRows<'a> {
+    values: &'a Values,
+    scale: &'a [f64],
+}
+
+impl SymmetricRows<'_> {
+    /// Values each spectrum needs for the per-chunk lower-triangle sums: chunk
+    /// `c` collects what its rows add to outputs `bounds[c] + 1..n`.
+    fn accumulator_len(&self) -> usize {
+        let n = self.scale.len();
+        let bounds = symmetric_bounds(n);
+        bounds[..bounds.len() - 1].iter().map(|&a| n - a - 1).sum()
+    }
+
+    /// Smooth every signal in `signals` into the matching `out`.
+    ///
+    /// Each stored row `i` is read once per call: in one pass it gives the
+    /// upper-triangle dot product of output `i` and adds its weights, times
+    /// `signal[i]`, to the lower-triangle sums of the outputs after `i`. Those
+    /// sums are kept per chunk and added up in chunk order, so the result is
+    /// the same for any `n_cores` and for any number of signals per call.
+    fn apply_block(
+        &self,
+        signals: &[&[f64]],
+        out: &mut [&mut [f64]],
+        n_cores: usize,
+    ) -> Result<(), KernelError> {
+        match self.values {
+            Values::F64(stored) => self.apply_typed(stored, signals, out, n_cores),
+            Values::F32(stored) => self.apply_typed(stored, signals, out, n_cores),
+        }
+    }
+
+    fn apply_typed<W: simd::Weight>(
+        &self,
+        stored: &[W],
+        signals: &[&[f64]],
+        out: &mut [&mut [f64]],
+        n_cores: usize,
+    ) -> Result<(), KernelError> {
+        let n = self.scale.len();
+        let count = signals.len();
+        let bounds = symmetric_bounds(n);
+        let chunks = bounds.len() - 1;
+        let lengths: Vec<usize> = (0..chunks).map(|c| n - bounds[c] - 1).collect();
+        let offsets: Vec<usize> = lengths
+            .iter()
+            .scan(0, |at, &len| {
+                let here = *at;
+                *at += len;
+                Some(here)
+            })
+            .collect();
+        let width = lengths.iter().sum::<usize>();
+        // `upper[r][i]` is `signal[i]` plus output `i`'s upper-triangle dot
+        // product; `lower[r]` holds every chunk's lower-triangle sums.
+        let mut upper = zeroed_output(count, n)?;
+        let mut lower = zeroed_output(count, width)?;
+        {
+            type Item<'b> = (usize, Vec<&'b mut [f64]>, Vec<&'b mut [f64]>);
+            let mut items: Vec<Item<'_>> = (0..chunks)
+                .map(|c| (c, Vec::with_capacity(count), Vec::with_capacity(count)))
+                .collect();
+            let mut upper_rest: &mut [f64] = &mut upper;
+            let mut lower_rest: &mut [f64] = &mut lower;
+            for _ in 0..count {
+                let (row_upper, tail) = std::mem::take(&mut upper_rest).split_at_mut(n);
+                upper_rest = tail;
+                let (row_lower, tail) = std::mem::take(&mut lower_rest).split_at_mut(width);
+                lower_rest = tail;
+                let rows = split_lengths(row_upper, (0..chunks).map(|c| bounds[c + 1] - bounds[c]));
+                let sums = split_lengths(row_lower, lengths.iter().copied());
+                for (item, (rows, sums)) in items.iter_mut().zip(rows.into_iter().zip(sums)) {
+                    item.1.push(rows);
+                    item.2.push(sums);
+                }
+            }
+            let process = |(c, mut parts, mut sums): Item<'_>| {
+                let a = bounds[c];
+                let mut dots = vec![0.0; count];
+                let mut heads = vec![0.0; count];
+                for i in a..bounds[c + 1] {
+                    let len = n - 1 - i;
+                    let at = symmetric_offset(n, i);
+                    let tails: Vec<&[f64]> = signals.iter().map(|s| &s[i + 1..n]).collect();
+                    for (head, s) in heads.iter_mut().zip(signals) {
+                        *head = s[i];
+                    }
+                    let mut targets: Vec<&mut [f64]> = sums
+                        .iter_mut()
+                        .map(|z| &mut z[i - a..i - a + len])
+                        .collect();
+                    simd::dot_axpy_batch(
+                        &stored[at..at + len],
+                        &tails,
+                        &mut targets,
+                        &heads,
+                        &mut dots,
+                    );
+                    for r in 0..count {
+                        parts[r][i - a] = heads[r] + dots[r];
+                    }
+                }
+            };
+            let workers = n_cores.max(1).min(chunks);
+            if workers <= 1 {
+                items.into_iter().for_each(process);
+            } else {
+                let queue = Mutex::new(items.into_iter());
+                std::thread::scope(|scope| {
+                    for _ in 0..workers {
+                        scope.spawn(|| loop {
+                            let next = queue.lock().expect("chunk queue lock").next();
+                            match next {
+                                Some(item) => process(item),
+                                None => return,
+                            }
+                        });
+                    }
+                });
+            }
+        }
+        for r in 0..count {
+            let row_upper = &upper[r * n..(r + 1) * n];
+            let row_lower = &lower[r * width..(r + 1) * width];
+            for (i, dest) in out[r].iter_mut().enumerate() {
+                let mut total = row_upper[i];
+                for c in 0..chunks {
+                    let a = bounds[c];
+                    if a >= i {
+                        break;
+                    }
+                    total += row_lower[offsets[c] + i - a - 1];
+                }
+                *dest = total * self.scale[i];
+            }
+        }
+        Ok(())
+    }
+}
+
 fn for_each_chunk(n_cores: usize, out: &mut [f64], f: &(impl Fn(&mut [f64], usize) + Sync)) {
-    let n = out.len();
+    for_each_block(n_cores, out, 1, 64, false, f);
+}
+
+/// Run `f(part, first)` over disjoint blocks of `out` on up to `n_cores`
+/// workers, where `out` holds items of `width` values each and `first` is the
+/// index of the block's first item. Blocks are handed out as workers free up,
+/// so uneven work (the approx window widens with frequency on a linear grid)
+/// still balances. Each item is computed by exactly one worker, in a fixed
+/// order, so the result does not depend on the worker count.
+fn for_each_block(
+    n_cores: usize,
+    out: &mut [f64],
+    width: usize,
+    grain: usize,
+    reverse: bool,
+    f: &(impl Fn(&mut [f64], usize) + Sync),
+) {
+    debug_assert!(width > 0 && out.len().is_multiple_of(width));
+    let n = out.len() / width;
     let workers = n_cores.max(1).min(n.max(1));
-    // About 32 blocks per worker, and at least 64 outputs per block so the
+    // About 32 blocks per worker, and at least `grain` items per block so the
     // lock around the block iterator stays negligible.
-    let block = (n / (workers * 32)).clamp(64, 4096);
+    let block = (n / (workers * 32)).clamp(grain.max(1), 4096.max(grain));
     // A short output has fewer blocks than workers; a thread per block is
     // enough, and one block runs on the calling thread.
     let workers = workers.min(n.div_ceil(block));
-    if workers <= 1 {
+    if workers <= 1 && !reverse {
         f(out, 0);
         return;
     }
-    let blocks = Mutex::new(out.chunks_mut(block).enumerate());
+    // Blocks go out last-first when `reverse` is set.
+    let order: Box<dyn Iterator<Item = (usize, &mut [f64])> + Send> = if reverse {
+        Box::new(out.chunks_mut(block * width).enumerate().rev())
+    } else {
+        Box::new(out.chunks_mut(block * width).enumerate())
+    };
+    if workers <= 1 {
+        for (index, part) in order {
+            f(part, index * block);
+        }
+        return;
+    }
+    let blocks = Mutex::new(order);
     std::thread::scope(|scope| {
         for _ in 0..workers {
             scope.spawn(|| loop {
@@ -972,21 +1425,144 @@ mod tests {
                 assert_eq!(values.len() as u64, approx);
                 assert_eq!(*start.last().unwrap() as u64, approx);
             }
-            Kind::Convolution { .. } => panic!("expected sparse weights"),
+            _ => panic!("expected sparse weights"),
         }
     }
 
     #[test]
     fn rejects_weight_matrix_above_u32() {
-        // 70000 * 70000 = 4.9e9 weights, more than u32::MAX, so this must fail
-        // before any of them is allocated.
+        // Different grids: 70000 * 69999 weights. Same grid, stored once per
+        // pair: 100000 * 99999 / 2. Both exceed u32::MAX and must fail before
+        // any weight is allocated.
         let freq: Vec<f64> = (0..70_000).map(|i| 1.0 + i as f64 * 1e-5).collect();
-        let err = build_plan(freq.clone(), freq, 40.0, Method::Exact, DType::F64).unwrap_err();
-        assert!(matches!(err, KernelError::Invalid(_)), "{err:?}");
-        assert!(
-            err.to_string().contains("smooth(method=\"exact\")"),
-            "{err:?}"
-        );
+        let out = freq[1..].to_vec();
+        let same: Vec<f64> = (0..100_000).map(|i| 1.0 + i as f64 * 1e-5).collect();
+        for err in [
+            build_plan(freq, out, 40.0, Method::Exact, DType::F64).unwrap_err(),
+            build_plan(same.clone(), same, 40.0, Method::Exact, DType::F64).unwrap_err(),
+        ] {
+            assert!(matches!(err, KernelError::Invalid(_)), "{err:?}");
+            assert!(
+                err.to_string().contains("smooth(method=\"exact\")"),
+                "{err:?}"
+            );
+        }
+    }
+
+    fn uneven_grid(n: usize) -> Vec<f64> {
+        let mut f = 0.2;
+        (0..n)
+            .map(|i| {
+                f += 0.05 + 0.03 * ((i * 7919) % 13) as f64 / 13.0;
+                f
+            })
+            .collect()
+    }
+
+    #[test]
+    fn alternating_sweeps_give_the_same_result() {
+        let freq = uneven_grid(203);
+        let out: Vec<f64> = freq.iter().step_by(3).map(|f| f * 1.001).collect();
+        let signal: Vec<f64> = freq.iter().map(|f| f.cos() + 2.0).collect();
+        for method in [Method::Approx, Method::Exact] {
+            let plan = build_plan(freq.clone(), out.clone(), 15.0, method, DType::F64).unwrap();
+            assert!(matches!(plan.kind, Kind::Sparse { .. }));
+            let first = apply_plan(&plan, &signal, 1).unwrap();
+            for n_cores in [1, 1, 3, 3, 2] {
+                assert_eq!(
+                    apply_plan(&plan, &signal, n_cores).unwrap(),
+                    first,
+                    "{method:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symmetric_bounds_cover_every_row_once() {
+        for n in [1usize, 2, 3, 31, 32, 33, 100, 15000] {
+            let bounds = symmetric_bounds(n);
+            assert_eq!(bounds[0], 0);
+            assert_eq!(*bounds.last().unwrap(), n);
+            assert!(
+                bounds.windows(2).all(|pair| pair[0] < pair[1]),
+                "n={n} {bounds:?}"
+            );
+            assert!(bounds.len() <= 33, "n={n}");
+        }
+        assert_eq!(symmetric_offset(5, 0), 0);
+        assert_eq!(symmetric_offset(5, 1), 4);
+        assert_eq!(symmetric_offset(5, 4), 10);
+        assert_eq!(symmetric_offset(5, 5), 10);
+    }
+
+    #[test]
+    fn symmetric_plan_matches_the_dense_exact_weights() {
+        for n in [1usize, 2, 17, 137] {
+            let freq = uneven_grid(n);
+            let signal: Vec<f64> = freq.iter().map(|f| (f * 1.7).sin() + 1.3).collect();
+            let dense = build_sparse(&freq, &freq, 9.0, Method::Exact, DType::F64).unwrap();
+            let reference = match &dense {
+                Kind::Sparse {
+                    col0,
+                    start,
+                    values,
+                } => {
+                    let rows = SparseRows {
+                        col0,
+                        start,
+                        values,
+                    };
+                    {
+                        let mut reference = vec![0.0; n];
+                        rows.dot_range(0, &signal, &mut reference, false);
+                        reference
+                    }
+                }
+                _ => unreachable!(),
+            };
+            for (dtype, tolerance) in [(DType::F64, 1e-13), (DType::F32, 2e-6)] {
+                let plan =
+                    build_plan(freq.clone(), freq.clone(), 9.0, Method::Exact, dtype).unwrap();
+                assert!(matches!(plan.kind, Kind::Symmetric { .. }));
+                let got = apply_plan(&plan, &signal, 1).unwrap();
+                for (g, r) in got.iter().zip(&reference) {
+                    assert!(
+                        (g - r).abs() <= tolerance * r.abs(),
+                        "n={n} {dtype:?} {g} {r}"
+                    );
+                }
+            }
+        }
+        let one = build_plan(vec![3.0], vec![3.0], 40.0, Method::Exact, DType::F64).unwrap();
+        assert_eq!(apply_plan(&one, &[2.5], 1).unwrap(), vec![2.5]);
+    }
+
+    #[test]
+    fn symmetric_plan_is_identical_for_any_worker_count_and_batch() {
+        let freq = uneven_grid(613);
+        let n = freq.len();
+        let plan = build_plan(freq.clone(), freq.clone(), 12.0, Method::Exact, DType::F64).unwrap();
+        let signals: Vec<f64> = (0..5 * n)
+            .map(|k| ((k * 31 % 977) as f64).sqrt() + 0.1)
+            .collect();
+        let serial: Vec<Vec<f64>> = (0..5)
+            .map(|r| apply_plan(&plan, &signals[r * n..(r + 1) * n], 1).unwrap())
+            .collect();
+        for n_cores in [2, 3, 7, 64] {
+            assert_eq!(
+                apply_plan(&plan, &signals[..n], n_cores).unwrap(),
+                serial[0]
+            );
+            let batch = apply_many(&plan, &signals, 5, n, n_cores).unwrap();
+            for r in 0..5 {
+                assert_eq!(
+                    &batch[r * n..(r + 1) * n],
+                    &serial[r][..],
+                    "n_cores={n_cores} r={r}"
+                );
+            }
+        }
     }
 
     #[test]

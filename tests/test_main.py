@@ -585,13 +585,34 @@ def test_non_integer_n_cores_raise_type_error(n_cores):
 
 
 def test_exact_weights_too_large_raise_before_allocating():
-    # 70000 * 70000 weights exceed what the class can index, so this must fail
-    # before any of them is allocated.
+    # More than 2**32 - 1 stored weights must fail before any is allocated:
+    # 70000 * 69999 on different grids, and 100000 * 99999 / 2 on one grid,
+    # where each pair is stored once.
     freq = np.linspace(1.0, 2.0, 70_000)
-    with pytest.raises(ValueError, match=r'smooth\(method="exact"\)'):
-        ko.PrecomputedWeights(freq, bandwidth=40, method="exact")
-    with pytest.raises(ValueError, match=r'smooth\(method="exact"\)'):
-        ko.PrecomputedWeights(freq, bandwidth=40, method="exact", dtype="float32")
+    same = np.linspace(1.0, 2.0, 100_000)
+    for args in ((freq, {"freq_out": freq[1:]}), (same, {})):
+        grid, extra = args
+        for dtype in ("float64", "float32"):
+            with pytest.raises(ValueError, match=r'smooth\(method="exact"\)'):
+                ko.PrecomputedWeights(grid, bandwidth=40, method="exact", dtype=dtype, **extra)
+
+
+@pytest.mark.parametrize("n", [1, 2, 3, 37, 400])
+def test_exact_weights_on_one_grid_match_the_published_sum(n):
+    rng = np.random.default_rng(n)
+    freq = np.sort(rng.uniform(0.1, 30.0, n)) + np.arange(n) * 1e-9
+    signals = rng.uniform(0.2, 3.0, (5, n))
+    reference = np.vstack([_reference(s, freq, freq, 9.5, "exact") for s in signals])
+    weights = ko.PrecomputedWeights(freq, bandwidth=9.5, method="exact")
+    batch = weights.apply_many(signals)
+    np.testing.assert_allclose(batch, reference, rtol=1e-12, atol=0)
+    for row, smoothed in zip(signals, batch):
+        np.testing.assert_array_equal(weights.apply(row), smoothed)
+        np.testing.assert_allclose(
+            ko.smooth(row, freq, 9.5, method="exact"), smoothed, rtol=1e-12, atol=0
+        )
+    cheap = ko.PrecomputedWeights(freq, bandwidth=9.5, method="exact", dtype="float32")
+    np.testing.assert_allclose(cheap.apply_many(signals), reference, rtol=2e-6)
 
 
 def test_bad_method_dtype_cores_and_shapes_raise():

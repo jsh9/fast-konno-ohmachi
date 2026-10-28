@@ -14,6 +14,7 @@ use crate::kernel::{
 };
 
 mod kernel;
+mod simd;
 
 /// ``(copyreg.__newobj_ex__, (cls, args, kwargs))`` for ``__reduce__``.
 type Reduce<'py> = (
