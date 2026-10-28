@@ -5,9 +5,9 @@ Time fast_konno_ohmachi against pykooh on the Tohoku record in this folder.
     python demo/benchmark_pykooh.py               # every CPU the process may use
     taskset -c 0 python demo/benchmark_pykooh.py  # one CPU (Linux)
 
-Each case reports the best of several runs, builds included, so memory the
+Each case reports the best of several runs (builds included, so memory the
 process touches for the first time does not count against the first library
-timed. pykooh's numba kernel is compiled before any timing starts. fast_konno_ohmachi runs with n_cores=None, which uses
+timed), and fast cases keep running for about a second. pykooh's numba kernel is compiled before any timing starts. fast_konno_ohmachi runs with n_cores=None, which uses
 every CPU the process is allowed to run on, so `taskset -c 0` makes both
 libraries single-threaded (NumPy's BLAS included).
 
@@ -33,13 +33,20 @@ BANDWIDTH = 40.0
 N_SPECTRA = 64
 
 
-def best_time(fn, repeat):
+def best_time(fn, repeat, min_seconds=1.0, max_runs=500):
+    """Best of at least `repeat` runs, continuing until about `min_seconds`
+    have passed, so millisecond cases are not decided by a few noisy runs."""
     best = float("inf")
     result = None
-    for _ in range(repeat):
+    runs = 0
+    spent = 0.0
+    while runs < repeat or (spent < min_seconds and runs < max_runs):
         start = time.perf_counter()
         result = fn()
-        best = min(best, time.perf_counter() - start)
+        elapsed = time.perf_counter() - start
+        best = min(best, elapsed)
+        spent += elapsed
+        runs += 1
     return best, result
 
 
